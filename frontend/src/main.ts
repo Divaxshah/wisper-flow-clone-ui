@@ -173,7 +173,7 @@ async function startListening() {
     JSON.stringify({
       type: "start",
       language: languageEl.value || "auto",
-      profile: profileEl.value || "Fast",
+      profile: profileEl.value || "Lowest latency",
       cleanup: cleanupEl.checked,
     }),
   );

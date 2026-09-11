@@ -42,14 +42,14 @@ NEMOTRON_LANG_CHOICES = [
 NEMOTRON_LANG_CODES = {value for _, value in NEMOTRON_LANG_CHOICES}
 
 # Cache-aware streaming lookahead. Values are [left, right] in 80ms frames.
+# This checkpoint only supports right context in {0, 3, 6, 13} — not 1 (160ms).
 NEMOTRON_CHUNK_PROFILES = {
     "Lowest latency": [56, 0],
-    "Fast": [56, 1],
     "Balanced": [56, 3],
     "Accurate": [56, 6],
     "Most accurate": [56, 13],
 }
-NEMOTRON_DEFAULT_CHUNK = "Fast"
+NEMOTRON_DEFAULT_CHUNK = "Lowest latency"
 
 _model = None
 _model_error: str | None = None

@@ -93,7 +93,7 @@ async def transcribe_socket(ws: WebSocket) -> None:
                     from backend.asr import LiveSession
 
                     lang = payload.get("language") or "auto"
-                    profile = payload.get("profile") or "Fast"
+                    profile = payload.get("profile") or "Lowest latency"
                     cleanup_enabled = bool(payload.get("cleanup", True))
                     try:
                         session = await loop.run_in_executor(
