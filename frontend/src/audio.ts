@@ -55,8 +55,7 @@ export function micUnavailableReason(): string | null {
   if (!secure || !navigator.mediaDevices?.getUserMedia) {
     return (
       "The browser hid the microphone because this page is not a secure context. " +
-      "Use the HTTPS URL Vite prints (accept the self-signed cert), or SSH-tunnel " +
-      "and open http://127.0.0.1:5173 — getUserMedia is blocked on plain http://<ip>."
+      "Open the ngrok https:// URL, or http://127.0.0.1:5173 on this machine."
     );
   }
   return null;

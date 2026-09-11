@@ -18,12 +18,12 @@ npm install
 npm run dev
 ```
 
-Open the URL Vite prints. On this machine that is http://127.0.0.1:5173. From another computer or an EC2 public IP, use the **https://** Network address and accept the self-signed certificate — browsers hide `getUserMedia` on `http://<ip>`.
+Open http://127.0.0.1:5173 on the machine, or put ngrok in front of Vite and use the **https://** ngrok URL (browsers hide `getUserMedia` on plain `http://<ip>`).
 
 ```bash
-# from your laptop, if you would rather keep HTTP
-ssh -L 5173:127.0.0.1:5173 -L 8000:127.0.0.1:8000 ubuntu@<host>
-# then open http://127.0.0.1:5173
+cd wisper-flow-clone-ui/frontend
+npm run dev -- --host 0.0.0.0
+ngrok http 5173
 ```
 
 The ASR process must be running on the same host (`uv run --package backend backend`). Vite proxies `/api` and `/ws` to `127.0.0.1:8000`.
