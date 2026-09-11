@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[oc]
+*.egg-info/
+.venv/
+.env
+
+# Frontend
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Logs and local leftovers
+*.log
+.DS_Store

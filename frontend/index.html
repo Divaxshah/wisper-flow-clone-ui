@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Hold to speak. Nemotron streams your words; a pause settles each sentence."
+    />
+    <title>Wisper — live dictation</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&family=Spline+Sans:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+  </head>
+  <body>
+    <div class="app">
+      <header class="chrome">
+        <p class="mark">Wisper</p>
+        <div class="controls">
+          <label class="field">
+            <span>Language</span>
+            <select id="language"></select>
+          </label>
+          <label class="field">
+            <span>Latency</span>
+            <select id="profile"></select>
+          </label>
+          <label class="check">
+            <input type="checkbox" id="cleanup" checked />
+            <span>Clean after pause</span>
+          </label>
+        </div>
+      </header>
+
+      <main class="stage">
+        <p id="model-status" class="model-status" role="status"></p>
+        <div id="transcript" class="transcript" aria-live="polite" aria-relevant="additions text">
+          <p class="empty" id="empty">
+            Hold the pedal and talk.
+            <span>A short pause settles the sentence.</span>
+          </p>
+        </div>
+        <p id="live" class="live" hidden></p>
+      </main>
+
+      <footer class="dock">
+        <div id="vu" class="vu" aria-hidden="true"></div>
+        <button type="button" id="pedal" class="pedal" aria-pressed="false">
+          <span class="pedal-label" data-idle="Hold to speak" data-hot="Listening">Hold to speak</span>
+        </button>
+        <p id="hint" class="hint">Space works too. Release, or pause, to lock the line.</p>
+        <button type="button" id="copy" class="copy" hidden>Copy transcript</button>
+      </footer>
+    </div>
+
+    <p id="toast" class="toast" hidden role="status"></p>
+    <p id="error" class="error" hidden role="alert"></p>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
