@@ -77,6 +77,7 @@ function ensureSocket(): Promise<WebSocket> {
   }
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(wsUrl());
+    ws.binaryType = "arraybuffer";
     const fail = () =>
       reject(
         new Error(
@@ -172,27 +173,28 @@ async function startListening() {
     JSON.stringify({
       type: "start",
       language: languageEl.value || "auto",
-      profile: profileEl.value || "Balanced",
+      profile: profileEl.value || "Fast",
       cleanup: cleanupEl.checked,
     }),
   );
   try {
     capture = await startCapture({
-    onPcm: (bytes) => {
-      if (socket && socket.readyState === WebSocket.OPEN) socket.send(bytes);
-    },
-    onLevel: (values) => {
-      values.forEach((value, i) => {
-        const bar = vuBars[i];
-        if (bar) bar.style.transform = `scaleY(${Math.max(0.08, Math.min(1, value * 3))})`;
-      });
-    },
-    onPause: () => {
-      if (socket && socket.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify({ type: "commit" }));
-      }
-    },
-  });
+      onPcm: (bytes) => {
+        if (socket && socket.readyState === WebSocket.OPEN) socket.send(bytes);
+      },
+      onLevel: (values) => {
+        values.forEach((value, i) => {
+          const bar = vuBars[i];
+          if (bar) bar.style.transform = `scaleY(${Math.max(0.08, Math.min(1, value * 3))})`;
+        });
+      },
+      pauseMs: 900,
+      onPause: () => {
+        if (socket && socket.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({ type: "commit" }));
+        }
+      },
+    });
   } catch (err) {
     if (socket && socket.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify({ type: "end" }));

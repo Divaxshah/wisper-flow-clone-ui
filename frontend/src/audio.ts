@@ -1,10 +1,27 @@
 const TARGET_SR = 16000;
 const WORKLET = `
 class CaptureProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this._chunks = [];
+    this._samples = 0;
+    this._target = Math.round(sampleRate * 0.16);
+  }
   process(inputs) {
     const channel = inputs[0] && inputs[0][0];
-    if (channel && channel.length) {
-      this.port.postMessage(channel);
+    if (!channel || !channel.length) return true;
+    this._chunks.push(Float32Array.from(channel));
+    this._samples += channel.length;
+    if (this._samples >= this._target) {
+      const out = new Float32Array(this._samples);
+      let offset = 0;
+      for (const chunk of this._chunks) {
+        out.set(chunk, offset);
+        offset += chunk.length;
+      }
+      this.port.postMessage(out, [out.buffer]);
+      this._chunks = [];
+      this._samples = 0;
     }
     return true;
   }
@@ -70,7 +87,7 @@ export async function startCapture(options: {
   const blocked = micUnavailableReason();
   if (blocked) throw new Error(blocked);
 
-  const pauseMs = options.pauseMs ?? 600;
+  const pauseMs = options.pauseMs ?? 900;
   const stream = await navigator.mediaDevices.getUserMedia({
     audio: {
       channelCount: 1,

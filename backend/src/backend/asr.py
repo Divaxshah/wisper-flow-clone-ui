@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import copy
 import os
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -47,7 +49,7 @@ NEMOTRON_CHUNK_PROFILES = {
     "Accurate": [56, 6],
     "Most accurate": [56, 13],
 }
-NEMOTRON_DEFAULT_CHUNK = "Balanced"
+NEMOTRON_DEFAULT_CHUNK = "Fast"
 
 _model = None
 _model_error: str | None = None
@@ -154,12 +156,6 @@ def _extract_transcriptions(hypotheses) -> list[str]:
     return [str(hyp) for hyp in hypotheses]
 
 
-def _drop_extra_pre_encoded(asr_model, step_num: int, pad_and_drop_preencoded: bool) -> int:
-    if step_num == 0 and not pad_and_drop_preencoded:
-        return 0
-    return asr_model.encoder.streaming_cfg.drop_extra_pre_encoded
-
-
 def _split_nemotron_lang_tag(text: str) -> tuple[str, str]:
     match = re.search(r"\s*<([a-z]{2}(?:-[A-Za-z]{2})?)>\s*$", text)
     if not match:
@@ -179,9 +175,27 @@ def _move_cache(value, device, dtype):
     return value
 
 
+def _chunk_samples(profile: str) -> int:
+    """Nemotron right-context is in 80ms frames. One GPU step = (right + 1) * 80ms of 16 kHz audio."""
+    right = NEMOTRON_CHUNK_PROFILES[profile][1]
+    return int(TARGET_SR * (right + 1) * 0.08)
+
+
+def _make_preprocessor(model):
+    from omegaconf import OmegaConf
+
+    cfg = copy.deepcopy(model._cfg)
+    OmegaConf.set_struct(cfg.preprocessor, False)
+    cfg.preprocessor.dither = 0.0
+    cfg.preprocessor.pad_to = 0
+    cfg.preprocessor.normalize = "None"
+    preprocessor = model.from_config_dict(cfg.preprocessor)
+    return preprocessor.to(next(model.parameters()).device)
+
+
 @dataclass
 class LiveSession:
-    """One WebSocket connection's cache-aware streaming state."""
+    """PCM queue in, one model-sized chunk per GPU step (NVIDIA mic-streaming path)."""
 
     lang: str = "auto"
     profile: str = NEMOTRON_DEFAULT_CHUNK
@@ -190,11 +204,9 @@ class LiveSession:
     detected_lang: str = ""
     pending: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
     step_num: int = 0
-    _stream_started: bool = False
 
     def __post_init__(self) -> None:
         import torch
-        from nemo.collections.asr.parts.utils.streaming_utils import CacheAwareStreamingAudioBuffer
 
         if self.profile not in NEMOTRON_CHUNK_PROFILES:
             raise ValueError(f"Unsupported chunk profile: {self.profile}")
@@ -206,43 +218,67 @@ class LiveSession:
             _configure_nemotron(model, self.lang, self.profile)
 
         self._model = model
-        self._buffer = CacheAwareStreamingAudioBuffer(
-            model=model,
-            online_normalization=False,
-            pad_and_drop_preencoded=False,
-        )
+        self._pcm_lock = threading.Lock()
+        self.chunk_samples = _chunk_samples(self.profile)
+        self._preprocessor = _make_preprocessor(model)
+        device = next(model.parameters()).device
+        dtype = torch.float32
         cache_last_channel, cache_last_time, cache_last_channel_len = (
             model.encoder.get_initial_cache_state(batch_size=1)
         )
-        device = next(model.parameters()).device
-        dtype = torch.float32
         self.cache_last_channel = _move_cache(cache_last_channel, device, dtype)
         self.cache_last_time = _move_cache(cache_last_time, device, dtype)
         self.cache_last_channel_len = _move_cache(cache_last_channel_len, device, dtype)
         self.previous_hypotheses = None
         self.previous_pred_out = None
+        pcs = model.encoder.streaming_cfg.pre_encode_cache_size
+        self.pre_encode_cache_size = pcs[1] if isinstance(pcs, (list, tuple)) else pcs
+        num_channels = int(model.cfg.preprocessor.features)
+        self.cache_pre_encode = torch.zeros(
+            (1, num_channels, self.pre_encode_cache_size), device=device, dtype=dtype
+        )
+        self._stable_since = time.monotonic()
 
-    def feed_pcm16(self, data: bytes) -> dict:
+    def add_pcm(self, data: bytes) -> None:
         if not data or len(data) < 2:
-            return self.snapshot()
+            return
         usable = len(data) - (len(data) % 2)
         samples = np.frombuffer(data[:usable], dtype=np.int16).astype(np.float32) / 32768.0
-        self.pending = np.concatenate([self.pending, samples])
-        min_samples = int(TARGET_SR * 0.08)
-        if len(self.pending) < min_samples:
-            return self.snapshot()
-        audio = self.pending
-        self.pending = np.zeros(0, dtype=np.float32)
-        self._append(audio)
-        self._step(final=False)
+        with self._pcm_lock:
+            self.pending = np.concatenate([self.pending, samples])
+
+    def has_chunk(self) -> bool:
+        with self._pcm_lock:
+            return len(self.pending) >= self.chunk_samples
+
+    def consume_chunks(self) -> dict:
+        while True:
+            with self._pcm_lock:
+                if len(self.pending) < self.chunk_samples:
+                    break
+                chunk = self.pending[: self.chunk_samples].copy()
+                self.pending = self.pending[self.chunk_samples :]
+            self._infer(chunk, final=False)
         return self.snapshot()
 
+    def feed_pcm16(self, data: bytes) -> dict:
+        self.add_pcm(data)
+        return self.consume_chunks()
+
     def flush(self) -> dict:
-        tail = self.pending
-        self.pending = np.zeros(0, dtype=np.float32)
-        silence = np.zeros(int(TARGET_SR * 0.4), dtype=np.float32)
-        self._append(np.concatenate([tail, silence]) if tail.size else silence)
-        self._step(final=True)
+        with self._pcm_lock:
+            tail = self.pending
+            self.pending = np.zeros(0, dtype=np.float32)
+        silence = np.zeros(max(self.chunk_samples, int(TARGET_SR * 0.4)), dtype=np.float32)
+        audio = np.concatenate([tail, silence]) if tail.size else silence
+        rem = len(audio) % self.chunk_samples
+        if rem:
+            audio = np.concatenate(
+                [audio, np.zeros(self.chunk_samples - rem, dtype=np.float32)]
+            )
+        for i in range(0, len(audio), self.chunk_samples):
+            last = i + self.chunk_samples >= len(audio)
+            self._infer(audio[i : i + self.chunk_samples], final=last)
         return self.snapshot()
 
     def live_span(self) -> str:
@@ -252,17 +288,20 @@ class LiveSession:
             return full
         if full.startswith(committed):
             return full[len(committed) :].strip()
-        # Hypothesis was revised behind the commit point.
         if committed in full:
             idx = full.rfind(committed)
             return full[idx + len(committed) :].strip()
         return full.strip()
 
-    def commit(self) -> str:
-        """Lock the current live span as a pause-delimited sentence. Returns the raw span."""
+    def commit(self, force: bool = False) -> str:
         span = self.live_span().strip()
         if not span:
             return ""
+        if not force:
+            if time.monotonic() - self._stable_since < 0.4:
+                return ""
+            if len(span) < 6 and " " not in span:
+                return ""
         if self.full_text.startswith(self.committed):
             self.committed = self.full_text
         else:
@@ -276,52 +315,48 @@ class LiveSession:
             "detected_lang": self.detected_lang,
         }
 
-    def _append(self, audio: np.ndarray) -> None:
-        if audio.size == 0:
-            return
-        stream_id = 0 if self._stream_started else -1
-        self._buffer.append_audio(audio, stream_id=stream_id)
-        self._stream_started = True
-
-    def _step(self, final: bool) -> None:
+    def _infer(self, audio: np.ndarray, final: bool) -> None:
         import torch
 
-        if self._buffer.buffer is None:
-            return
         model = self._model
-        model_device = next(model.parameters()).device
-        stream_dtype = torch.float32
-        with _lock:
-            for chunk_audio, chunk_lengths in self._buffer:
-                keep_all = final and self._buffer.is_buffer_empty()
-                with torch.inference_mode():
-                    chunk_audio = chunk_audio.to(device=model_device, dtype=stream_dtype)
-                    chunk_lengths = chunk_lengths.to(device=model_device)
-                    (
-                        self.previous_pred_out,
-                        transcribed_texts,
-                        self.cache_last_channel,
-                        self.cache_last_time,
-                        self.cache_last_channel_len,
-                        self.previous_hypotheses,
-                    ) = model.conformer_stream_step(
-                        processed_signal=chunk_audio,
-                        processed_signal_length=chunk_lengths,
-                        cache_last_channel=self.cache_last_channel,
-                        cache_last_time=self.cache_last_time,
-                        cache_last_channel_len=self.cache_last_channel_len,
-                        keep_all_outputs=keep_all,
-                        previous_hypotheses=self.previous_hypotheses,
-                        previous_pred_out=self.previous_pred_out,
-                        drop_extra_pre_encoded=_drop_extra_pre_encoded(model, self.step_num, False),
-                        return_transcription=True,
-                    )
-                raw = _extract_transcriptions(transcribed_texts)[0]
-                text, lang = _split_nemotron_lang_tag(raw)
-                self.full_text = text
-                if lang:
-                    self.detected_lang = lang
-                self.step_num += 1
+        device = next(model.parameters()).device
+        audio_signal = torch.from_numpy(np.ascontiguousarray(audio)).unsqueeze(0).to(device)
+        audio_signal_len = torch.tensor([audio.shape[0]], device=device)
+        processed_signal, processed_signal_length = self._preprocessor(
+            input_signal=audio_signal, length=audio_signal_len
+        )
+        processed_signal = torch.cat([self.cache_pre_encode, processed_signal], dim=-1)
+        processed_signal_length = processed_signal_length + self.cache_pre_encode.size(-1)
+        self.cache_pre_encode = processed_signal[:, :, -self.pre_encode_cache_size :].clone()
+
+        with _lock, torch.inference_mode():
+            (
+                self.previous_pred_out,
+                transcribed_texts,
+                self.cache_last_channel,
+                self.cache_last_time,
+                self.cache_last_channel_len,
+                self.previous_hypotheses,
+            ) = model.conformer_stream_step(
+                processed_signal=processed_signal,
+                processed_signal_length=processed_signal_length,
+                cache_last_channel=self.cache_last_channel,
+                cache_last_time=self.cache_last_time,
+                cache_last_channel_len=self.cache_last_channel_len,
+                keep_all_outputs=final,
+                previous_hypotheses=self.previous_hypotheses,
+                previous_pred_out=self.previous_pred_out,
+                drop_extra_pre_encoded=None,
+                return_transcription=True,
+            )
+        raw = _extract_transcriptions(transcribed_texts)[0]
+        text, lang = _split_nemotron_lang_tag(raw)
+        if text != self.full_text:
+            self._stable_since = time.monotonic()
+        self.full_text = text
+        if lang:
+            self.detected_lang = lang
+        self.step_num += 1
 
 
 def load_dotenv_files() -> None:

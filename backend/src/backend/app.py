@@ -65,6 +65,17 @@ async def transcribe_socket(ws: WebSocket) -> None:
     try:
         meta = runtime_status()
         await send({"type": "ready", **meta})
+        drain_task: asyncio.Task | None = None
+
+        async def drain_audio() -> None:
+            current = session
+            if current is None:
+                return
+            snap = await loop.run_in_executor(None, current.consume_chunks)
+            await send({"type": "partial", **snap})
+            while current.has_chunk():
+                snap = await loop.run_in_executor(None, current.consume_chunks)
+                await send({"type": "partial", **snap})
 
         while True:
             message = await ws.receive()
@@ -82,7 +93,7 @@ async def transcribe_socket(ws: WebSocket) -> None:
                     from backend.asr import LiveSession
 
                     lang = payload.get("language") or "auto"
-                    profile = payload.get("profile") or "Balanced"
+                    profile = payload.get("profile") or "Fast"
                     cleanup_enabled = bool(payload.get("cleanup", True))
                     try:
                         session = await loop.run_in_executor(
@@ -99,7 +110,7 @@ async def transcribe_socket(ws: WebSocket) -> None:
                 if kind == "commit":
                     if session is None:
                         continue
-                    raw = session.commit()
+                    raw = session.commit(force=False)
                     if not raw:
                         continue
                     sentence_id += 1
@@ -119,7 +130,7 @@ async def transcribe_socket(ws: WebSocket) -> None:
                     if session is not None:
                         snap = await loop.run_in_executor(None, session.flush)
                         await send({"type": "partial", **snap})
-                        raw = session.commit()
+                        raw = session.commit(force=True)
                         if raw:
                             sentence_id += 1
                             await send({"type": "commit", "id": sentence_id, "raw": raw})
@@ -147,8 +158,9 @@ async def transcribe_socket(ws: WebSocket) -> None:
             data = message.get("bytes")
             if not data or session is None:
                 continue
-            snap = await loop.run_in_executor(None, session.feed_pcm16, data)
-            await send({"type": "partial", **snap})
+            session.add_pcm(data)
+            if drain_task is None or drain_task.done():
+                drain_task = asyncio.create_task(drain_audio())
 
     except WebSocketDisconnect:
         pass
