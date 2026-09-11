@@ -47,12 +47,30 @@ export type CaptureHandle = {
   stop: () => Promise<void>;
 };
 
+export function micUnavailableReason(): string | null {
+  const secure =
+    window.isSecureContext ||
+    location.hostname === "localhost" ||
+    location.hostname === "127.0.0.1";
+  if (!secure || !navigator.mediaDevices?.getUserMedia) {
+    return (
+      "The browser hid the microphone because this page is not a secure context. " +
+      "Use the HTTPS URL Vite prints (accept the self-signed cert), or SSH-tunnel " +
+      "and open http://127.0.0.1:5173 — getUserMedia is blocked on plain http://<ip>."
+    );
+  }
+  return null;
+}
+
 export async function startCapture(options: {
   onPcm: (bytes: ArrayBuffer) => void;
   onLevel: (values: number[]) => void;
   onPause: () => void;
   pauseMs?: number;
 }): Promise<CaptureHandle> {
+  const blocked = micUnavailableReason();
+  if (blocked) throw new Error(blocked);
+
   const pauseMs = options.pauseMs ?? 600;
   const stream = await navigator.mediaDevices.getUserMedia({
     audio: {

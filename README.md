@@ -18,7 +18,15 @@ npm install
 npm run dev
 ```
 
-Open http://127.0.0.1:5173
+Open the URL Vite prints. On this machine that is http://127.0.0.1:5173. From another computer or an EC2 public IP, use the **https://** Network address and accept the self-signed certificate — browsers hide `getUserMedia` on `http://<ip>`.
+
+```bash
+# from your laptop, if you would rather keep HTTP
+ssh -L 5173:127.0.0.1:5173 -L 8000:127.0.0.1:8000 ubuntu@<host>
+# then open http://127.0.0.1:5173
+```
+
+The ASR process must be running on the same host (`uv run --package backend backend`). Vite proxies `/api` and `/ws` to `127.0.0.1:8000`.
 
 The pedal stays locked until `/api/status` reports `ready`. Hold it (or hold Space) to speak. A ~600ms silence commits the current line; OpenRouter then rewrites that span. A short click latches listening until you click again.
 

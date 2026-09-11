@@ -1,5 +1,5 @@
 import "./styles.css";
-import { startCapture, type CaptureHandle } from "./audio";
+import { micUnavailableReason, startCapture, type CaptureHandle } from "./audio";
 import type { ServerEvent, StatusPayload } from "./types";
 
 const languageEl = document.querySelector<HTMLSelectElement>("#language")!;
@@ -77,11 +77,18 @@ function ensureSocket(): Promise<WebSocket> {
   }
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(wsUrl());
+    const fail = () =>
+      reject(
+        new Error(
+          "Could not reach the ASR server. Start it with `uv run --package backend backend` " +
+            "so something is listening on 127.0.0.1:8000, then retry.",
+        ),
+      );
     ws.addEventListener("open", () => {
       socket = ws;
       resolve(ws);
     });
-    ws.addEventListener("error", () => reject(new Error("Could not reach the ASR server.")));
+    ws.addEventListener("error", fail);
     ws.addEventListener("message", (event) => {
       try {
         onEvent(JSON.parse(event.data) as ServerEvent);
@@ -158,6 +165,8 @@ function onEvent(event: ServerEvent) {
 async function startListening() {
   if (listening) return;
   showError(null);
+  const blocked = micUnavailableReason();
+  if (blocked) throw new Error(blocked);
   const ws = await ensureSocket();
   ws.send(
     JSON.stringify({
@@ -167,7 +176,8 @@ async function startListening() {
       cleanup: cleanupEl.checked,
     }),
   );
-  capture = await startCapture({
+  try {
+    capture = await startCapture({
     onPcm: (bytes) => {
       if (socket && socket.readyState === WebSocket.OPEN) socket.send(bytes);
     },
@@ -183,6 +193,14 @@ async function startListening() {
       }
     },
   });
+  } catch (err) {
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: "end" }));
+      socket.close();
+    }
+    socket = null;
+    throw err;
+  }
   setListening(true);
 }
 
@@ -300,4 +318,6 @@ copyBtn.addEventListener("click", async () => {
 });
 
 pedal.disabled = true;
+const micBlock = micUnavailableReason();
+if (micBlock) showError(micBlock);
 loadStatus().catch((err) => showError(err.message));
