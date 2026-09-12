@@ -1,8 +1,10 @@
 """OpenRouter cleanup for one pause-delimited spoken span."""
 
 from __future__ import annotations
-
+from dotenv import load_dotenv 
 import os
+
+load_dotenv()
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "openai/gpt-4o-mini")
