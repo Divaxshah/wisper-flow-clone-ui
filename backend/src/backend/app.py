@@ -63,13 +63,15 @@ async def transcribe_socket(ws: WebSocket) -> None:
     async def clean_after(previous, sid, raw):
         if previous:
             await previous
+        cleanup_status = "applied"
         try:
             cleaned = await asyncio.to_thread(cleanup_span, raw, " ".join(prior_cleaned[-3:]))
         except Exception:
+            cleanup_status = "failed"
             cleaned = raw
             await send({"type": "warning", "message": "Text cleanup is unavailable. Your original transcript has been kept."})
         prior_cleaned.append(cleaned)
-        await send({"type": "cleaned", "id": sid, "raw": raw, "cleaned": cleaned})
+        await send({"type": "cleaned", "id": sid, "raw": raw, "cleaned": cleaned, "cleanup_status": cleanup_status})
 
     async def commit(force=False):
         nonlocal sentence_id, cleanup_task
@@ -77,11 +79,11 @@ async def transcribe_socket(ws: WebSocket) -> None:
         if not raw:
             return
         sentence_id += 1
-        await send({"type": "commit", "id": sentence_id, "raw": raw})
+        await send({"type": "commit", "id": sentence_id, "raw": raw, "cleanup_status": "pending" if cleanup_enabled else "skipped"})
         if cleanup_enabled:
             cleanup_task = asyncio.create_task(clean_after(cleanup_task, sentence_id, raw))
         else:
-            await send({"type": "cleaned", "id": sentence_id, "raw": raw, "cleaned": raw})
+            await send({"type": "cleaned", "id": sentence_id, "raw": raw, "cleaned": raw, "cleanup_status": "skipped"})
 
     async def drain_audio():
         try:

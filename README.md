@@ -76,3 +76,22 @@ Restart the backend; it serves `frontend/dist` at http://127.0.0.1:8000. This is
 - [NVIDIA model and cache-aware streaming guidance](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b)
 - [Wispr Flow smart formatting and backtrack](https://docs.wisprflow.ai/articles/5373093536-how-do-i-use-smart-formatting-and-backtrack)
 - [Google Gboard Rambler](https://support.google.com/gboard/answer/17468539)
+
+## Workspace and cleanup checks
+
+The workspace now has an internally scrolling transcript and a persistent recording bar. It follows live text only while you are at the bottom; **Back to live text** resumes following after you scroll up. The **Original / Polished** control preserves both versions. A status below the document distinguishes pending cleanup, applied cleanup, and a fallback to original wording.
+
+Cleanup is instructed to retain complete sentences and speech intent rather than summarize text into topic labels. Empty, refused, and incomplete provider responses preserve the original text and report a failure. Cleanup still operates per pause-delimited span and cannot revise earlier spans.
+
+```bash
+# Run Vite in a separate terminal, then from frontend/:
+npx playwright install chromium
+npm run test:ui
+# Or use installed Chrome:
+CHROME_PATH=/usr/bin/google-chrome npm run test:ui
+
+# From the repository root, with a configured OpenRouter key:
+PYTHONPATH=backend/src python backend/tests/smoke_cleanup.py
+```
+
+The browser suite mocks ASR and uses synthetic microphone audio to check layout stability with long transcripts, 320/390 px mobile layouts, language and recognition controls, cleanup status, original/polished switching, and recording restart. The optional cleanup smoke test sends five public fixtures to the configured model and incurs API usage; read its outputs to assess meaning preservation.

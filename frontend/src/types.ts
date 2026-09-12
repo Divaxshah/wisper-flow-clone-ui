@@ -11,8 +11,19 @@ export type ServerEvent =
       profile?: string;
     }
   | { type: "partial"; full: string; live: string; detected_lang: string }
-  | { type: "commit"; id: number; raw: string }
-  | { type: "cleaned"; id: number; raw: string; cleaned: string }
+  | {
+      type: "commit";
+      id: number;
+      raw: string;
+      cleanup_status?: "pending" | "skipped";
+    }
+  | {
+      type: "cleaned";
+      id: number;
+      raw: string;
+      cleaned: string;
+      cleanup_status?: "applied" | "skipped" | "failed";
+    }
   | { type: "error" | "warning"; message: string };
 
 export type StatusPayload = {

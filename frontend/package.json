@@ -6,9 +6,11 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:ui": "node tests/workspace.cjs"
   },
   "devDependencies": {
+    "playwright": "^1.63.0",
     "typescript": "^5.9.2",
     "vite": "^7.1.7"
   }
