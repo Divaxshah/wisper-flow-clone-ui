@@ -24,7 +24,64 @@ const vuBars = [...vuEl.querySelectorAll("i")];
 
 let socket: WebSocket | null = null;
 let capture: CaptureHandle | null = null;
-let listening = false;
+let phase: "idle" | "starting" | "listening" | "stopping" = "idle";
+let stopRequested = false;
+let sessionNumber = 0;
+let modelReady = false;
+let statusLoaded = false;
+let phaseTimer = 0;
+let startAck: { resolve: () => void; reject: (error: Error) => void } | null = null;
+const activityEl = document.querySelector<HTMLElement>("#activity")!;
+const originalEl = document.querySelector<HTMLInputElement>("#original")!;
+const wordCountEl = document.querySelector<HTMLElement>("#word-count")!;
+
+function setPhase(next: typeof phase) {
+  phase = next;
+  setListening(next === "listening");
+  pedal.disabled = !modelReady || next === "stopping";
+  pedalLabel.textContent = { idle: "Start dictation", starting: "Connecting…", listening: "Stop dictation", stopping: "Finishing…" }[next];
+  activityEl.textContent = { idle: "Ready when you are", starting: "Preparing microphone and speech model", listening: "Listening · words appear as you speak", stopping: "Finishing your transcript" }[next];
+  document.body.dataset.phase = next;
+  languageEl.disabled = profileEl.disabled = next !== "idle";
+  cleanupEl.disabled = next !== "idle" || cleanupEl.dataset.available === "false";
+}
+
+function updateWords() {
+  const text = [...transcriptEl.querySelectorAll<HTMLElement>(".sentence")].map(el => el.textContent).join(" ");
+  wordCountEl.textContent = `${text.trim() ? text.trim().split(/\s+/u).length : 0} words`;
+}
+
+function renderSentence(el: HTMLElement) {
+  el.textContent = originalEl.checked ? el.dataset.raw ?? "" : el.dataset.cleaned ?? el.dataset.raw ?? "";
+  updateWords();
+}
+
+async function resetSession(message?: string) {
+  window.clearTimeout(phaseTimer);
+  startAck?.reject(new Error(message ?? "Recording cancelled."));
+  startAck = null;
+  const old = socket;
+  socket = null;
+  old?.close();
+  const oldCapture = capture;
+  capture = null;
+  await oldCapture?.stop().catch(() => {});
+  setPhase("idle");
+  if (message) {
+    if (!liveEl.hidden && liveEl.textContent?.trim()) {
+      const el = document.createElement("p");
+      el.className = "sentence";
+      el.dataset.raw = liveEl.textContent;
+      el.dataset.state = "settled";
+      transcriptEl.appendChild(el);
+      renderSentence(el);
+      liveEl.hidden = true;
+      liveEl.textContent = "";
+      copyBtn.hidden = false;
+    }
+    showError(message);
+  }
+}
 let holdStarted = 0;
 let pressWasListening = false;
 let spaceDown = false;
@@ -59,7 +116,6 @@ function toast(message: string) {
 }
 
 function setListening(on: boolean) {
-  listening = on;
   pedal.setAttribute("aria-pressed", String(on));
   pedalLabel.textContent = on ? pedalLabel.dataset.hot! : pedalLabel.dataset.idle!;
   vuEl.classList.toggle("is-hot", on);
@@ -72,45 +128,35 @@ function setListening(on: boolean) {
 }
 
 function ensureSocket(): Promise<WebSocket> {
-  if (socket && socket.readyState === WebSocket.OPEN) {
-    return Promise.resolve(socket);
-  }
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(wsUrl());
+    socket = ws;
     ws.binaryType = "arraybuffer";
-    const fail = () =>
-      reject(
-        new Error(
-          "Could not reach the ASR server. Start it with `uv run --package backend backend` " +
-            "so something is listening on 127.0.0.1:8000, then retry.",
-        ),
-      );
-    ws.addEventListener("open", () => {
-      socket = ws;
-      resolve(ws);
-    });
-    ws.addEventListener("error", fail);
+    const timer = window.setTimeout(() => {
+      reject(new Error("The speech server did not respond. Check the connection and retry."));
+      ws.close();
+    }, 10000);
+    ws.addEventListener("open", () => { window.clearTimeout(timer); resolve(ws); });
+    ws.addEventListener("error", () => reject(new Error("Could not connect to the speech server. Check that the backend is running.")));
     ws.addEventListener("message", (event) => {
-      try {
-        onEvent(JSON.parse(event.data) as ServerEvent);
-      } catch {
-        /* ignore malformed frames */
-      }
+      if (socket !== ws) return;
+      try { onEvent(JSON.parse(event.data) as ServerEvent); } catch { /* malformed frame */ }
     });
     ws.addEventListener("close", () => {
-      socket = null;
-      if (listening) stopListening();
+      window.clearTimeout(timer);
+      reject(new Error("The connection closed before recording started."));
+      if (socket === ws) void resetSession("Connection lost. Received text is preserved. Start again to reconnect.");
     });
   });
 }
 
 function sentenceEl(id: number): HTMLElement {
-  let el = transcriptEl.querySelector<HTMLElement>(`[data-id="${id}"]`);
+  let el = transcriptEl.querySelector<HTMLElement>(`[data-id="${sessionNumber}-${id}"]`);
   if (!el) {
     emptyEl.hidden = true;
     el = document.createElement("p");
     el.className = "sentence";
-    el.dataset.id = String(id);
+    el.dataset.id = `${sessionNumber}-${id}`;
     transcriptEl.appendChild(el);
   }
   copyBtn.hidden = false;
@@ -118,8 +164,21 @@ function sentenceEl(id: number): HTMLElement {
 }
 
 function onEvent(event: ServerEvent) {
-  if (event.type === "error") {
+  if (event.type === "started") {
+    startAck?.resolve();
+    startAck = null;
+    return;
+  }
+  if (event.type === "ended") {
+    void resetSession();
+    return;
+  }
+  if (event.type === "warning") {
     showError(event.message);
+    return;
+  }
+  if (event.type === "error") {
+    void resetSession(event.message);
     return;
   }
   if (event.type === "partial") {
@@ -142,82 +201,79 @@ function onEvent(event: ServerEvent) {
   if (event.type === "commit") {
     const el = sentenceEl(event.id);
     el.dataset.state = "cleaning";
-    el.textContent = event.raw;
+    el.dataset.raw = event.raw;
+    renderSentence(el);
     liveEl.hidden = true;
     liveEl.textContent = "";
     return;
   }
   if (event.type === "cleaned") {
     const el = sentenceEl(event.id);
-    const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    if (reduce) {
-      el.dataset.state = "settled";
-      el.textContent = event.cleaned;
-      return;
-    }
-    el.dataset.state = "settling";
-    window.setTimeout(() => {
-      el.textContent = event.cleaned;
-      el.dataset.state = "settled";
-    }, 120);
+    el.dataset.raw = event.raw;
+    el.dataset.cleaned = event.cleaned;
+    el.dataset.state = "settled";
+    renderSentence(el);
   }
 }
 
 async function startListening() {
-  if (listening) return;
+  if (phase !== "idle" || !modelReady) return;
+  setPhase("starting");
+  stopRequested = false;
+  sessionNumber += 1;
   showError(null);
-  const blocked = micUnavailableReason();
-  if (blocked) throw new Error(blocked);
-  const ws = await ensureSocket();
-  ws.send(
-    JSON.stringify({
-      type: "start",
-      language: languageEl.value || "auto",
-      profile: profileEl.value || "Lowest latency",
-      cleanup: cleanupEl.checked,
-    }),
-  );
   try {
-    capture = await startCapture({
-      onPcm: (bytes) => {
-        if (socket && socket.readyState === WebSocket.OPEN) socket.send(bytes);
-      },
-      onLevel: (values) => {
-        values.forEach((value, i) => {
-          const bar = vuBars[i];
-          if (bar) bar.style.transform = `scaleY(${Math.max(0.08, Math.min(1, value * 3))})`;
-        });
-      },
-      pauseMs: 900,
-      onPause: () => {
-        if (socket && socket.readyState === WebSocket.OPEN) {
-          socket.send(JSON.stringify({ type: "commit" }));
-        }
-      },
-    });
-  } catch (err) {
-    if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({ type: "end" }));
-      socket.close();
+    const blocked = micUnavailableReason();
+    if (blocked) throw new Error(blocked);
+    const ws = await ensureSocket();
+    const started = new Promise<void>((resolve, reject) => { startAck = { resolve, reject }; });
+    phaseTimer = window.setTimeout(() => startAck?.reject(new Error("Speech session startup timed out. Please retry.")), 30000);
+    ws.send(JSON.stringify({ type: "start", language: languageEl.value || "auto", profile: profileEl.value || "Balanced", cleanup: cleanupEl.checked }));
+    await started;
+    window.clearTimeout(phaseTimer);
+    if (stopRequested) {
+      setPhase("listening");
+      await stopListening();
+      return;
     }
-    socket = null;
-    throw err;
+    const handle = await startCapture({
+      onPcm: bytes => {
+        if (socket !== ws || ws.readyState !== WebSocket.OPEN) return;
+        if (ws.bufferedAmount > 16000 * 2 * 5) {
+          void resetSession("The connection cannot keep up with audio. Please reconnect and try again.");
+          return;
+        }
+        ws.send(bytes);
+      },
+      onLevel: values => values.forEach((value, i) => {
+        if (vuBars[i]) vuBars[i].style.transform = `scaleY(${Math.max(0.08, Math.min(1, value * 3))})`;
+      }),
+      pauseMs: 900,
+      onPause: () => { if (socket === ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "commit" })); },
+      onEnded: () => { if (phase === "listening") void stopListening(); },
+    });
+    if (socket !== ws) { await handle.stop(); return; }
+    capture = handle;
+    setPhase("listening");
+    if (stopRequested) await stopListening();
+  } catch (err) {
+    await resetSession(err instanceof Error ? err.message : "Microphone could not start.");
   }
-  setListening(true);
 }
 
 async function stopListening() {
-  if (!listening && !capture) return;
+  if (phase === "starting") { stopRequested = true; return; }
+  if (phase !== "listening") return;
+  setPhase("stopping");
   try {
     await capture?.stop();
-  } catch {
-    /* already closed */
-  }
-  capture = null;
-  if (socket && socket.readyState === WebSocket.OPEN) {
+    capture = null;
+    if (socket?.readyState !== WebSocket.OPEN) throw new Error("Connection lost. Please retry.");
     socket.send(JSON.stringify({ type: "end" }));
+    phaseTimer = window.setTimeout(() => void resetSession("Finishing timed out. Received text is preserved; you can start again."), 60000);
+  } catch (err) {
+    await resetSession(err instanceof Error ? err.message : "Recording stopped unexpectedly.");
   }
-  setListening(false);
 }
 
 function fillSelect(
@@ -239,18 +295,26 @@ async function loadStatus() {
   const res = await fetch("/api/status");
   if (!res.ok) throw new Error("Status endpoint failed.");
   const data = (await res.json()) as StatusPayload;
-  fillSelect(languageEl, data.languages, "auto");
-  fillSelect(
-    profileEl,
-    data.profiles.map((name) => ({ label: name, value: name })),
-    data.default_profile,
-  );
+  if (!statusLoaded) {
+    fillSelect(languageEl, data.languages, "auto");
+    fillSelect(
+      profileEl,
+      data.profiles.map((name) => ({ label: name, value: name })),
+      data.default_profile,
+    );
 
+    cleanupEl.dataset.available = String(data.cleanup_available);
+    if (!data.cleanup_available) cleanupEl.checked = false;
+    cleanupEl.disabled = !data.cleanup_available;
+    cleanupEl.title = data.cleanup_available ? "Clean up fillers and clear corrections" : "Set OPENROUTER_API_KEY on the server to enable cleanup";
+    statusLoaded = true;
+  }
   const apply = (payload: StatusPayload) => {
     if (payload.status === "ready") {
       statusEl.dataset.base = payload.device ? `Ready on ${payload.device}` : "Ready";
       statusEl.textContent = statusEl.dataset.base;
-      pedal.disabled = false;
+      modelReady = true;
+      if (phase === "idle") setPhase("idle");
       return true;
     }
     if (payload.status === "error") {
@@ -259,16 +323,12 @@ async function loadStatus() {
       pedal.disabled = true;
       return true;
     }
-    statusEl.textContent = "Loading Nemotron… the pedal unlocks when the checkpoint is ready.";
+    statusEl.textContent = "Preparing the speech model…";
     pedal.disabled = true;
     return false;
   };
 
-  if (apply(data)) return;
-  const poll = window.setInterval(async () => {
-    const next = (await (await fetch("/api/status")).json()) as StatusPayload;
-    if (apply(next)) window.clearInterval(poll);
-  }, 1500);
+  if (!apply(data)) window.setTimeout(() => void refreshStatus(), 1500);
 }
 
 function onPedalRelease() {
@@ -284,17 +344,24 @@ pedal.addEventListener("pointerdown", (event) => {
   event.preventDefault();
   pedal.setPointerCapture(event.pointerId);
   holdStarted = performance.now();
-  pressWasListening = listening;
-  if (!listening) startListening().catch((err) => showError(err.message));
+  pressWasListening = phase !== "idle";
+  if (phase === "idle") startListening().catch((err) => showError(err.message));
 });
 
 pedal.addEventListener("pointerup", onPedalRelease);
-pedal.addEventListener("pointercancel", onPedalRelease);
+pedal.addEventListener("pointercancel", () => void stopListening());
+pedal.addEventListener("click", event => {
+  if (event.detail === 0) { if (phase === "idle") void startListening(); else void stopListening(); }
+});
+originalEl.addEventListener("change", () => transcriptEl.querySelectorAll<HTMLElement>(".sentence").forEach(renderSentence));
+window.addEventListener("blur", () => {
+  if (spaceDown) { spaceDown = false; void stopListening(); }
+});
 
 window.addEventListener("keydown", (event) => {
   if (event.code !== "Space") return;
   const tag = (event.target as HTMLElement | null)?.tagName;
-  if (tag === "SELECT" || tag === "INPUT" || tag === "TEXTAREA") return;
+  if (tag === "SELECT" || tag === "INPUT" || tag === "TEXTAREA" || tag === "BUTTON" || (event.target as HTMLElement)?.isContentEditable) return;
   event.preventDefault();
   if (spaceDown || pedal.disabled) return;
   spaceDown = true;
@@ -303,8 +370,10 @@ window.addEventListener("keydown", (event) => {
 
 window.addEventListener("keyup", (event) => {
   if (event.code !== "Space") return;
+  if (!spaceDown) return;
+  event.preventDefault();
   spaceDown = false;
-  stopListening();
+  void stopListening();
 });
 
 copyBtn.addEventListener("click", async () => {
@@ -315,11 +384,18 @@ copyBtn.addEventListener("click", async () => {
   const live = liveEl.hidden ? "" : liveEl.textContent?.trim() ?? "";
   const text = [settled, live].filter(Boolean).join("\n");
   if (!text) return;
-  await navigator.clipboard.writeText(text);
-  toast("Copied");
+  try { await navigator.clipboard.writeText(text); toast("Transcript copied"); }
+  catch { showError("Clipboard is unavailable. Select your transcript and copy it manually."); }
 });
 
 pedal.disabled = true;
 const micBlock = micUnavailableReason();
 if (micBlock) showError(micBlock);
-loadStatus().catch((err) => showError(err.message));
+async function refreshStatus() {
+  try { await loadStatus(); }
+  catch {
+    statusEl.textContent = "Speech server unavailable · reconnecting…";
+    window.setTimeout(() => void refreshStatus(), 3000);
+  }
+}
+void refreshStatus();

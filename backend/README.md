@@ -1,9 +1,3 @@
-Realtime Nemotron ASR with pause-delimited sentence cleanup.
+# Wisper backend
 
-Run from the repo root:
-
-```bash
-uv run --package backend backend
-```
-
-The UI lives in `../frontend`. See `wisper-flow-clone-ui/README.md`.
+FastAPI WebSocket server for cache-aware Nemotron streaming and optional OpenRouter text cleanup. See the [repository README](../README.md) for setup, session behavior, and verification commands.

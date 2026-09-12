@@ -13,3 +13,6 @@ frontend/.vite/
 # Logs and local leftovers
 *.log
 .DS_Store
+
+# Test caches
+.pytest_cache/

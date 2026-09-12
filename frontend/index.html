@@ -18,47 +18,53 @@
   <body>
     <div class="app">
       <header class="chrome">
-        <p class="mark">Wisper</p>
+        <div class="brand"><p class="mark">Wisper<span class="brand-dot">.</span></p><span class="brand-caption">A little less typing.</span></div>
         <div class="controls">
           <label class="field">
             <span>Language</span>
             <select id="language"></select>
           </label>
           <label class="field">
-            <span>Latency</span>
+            <span>Recognition</span>
             <select id="profile"></select>
           </label>
           <label class="check">
             <input type="checkbox" id="cleanup" checked />
-            <span>Clean after pause</span>
+            <span>Smart cleanup</span>
           </label>
         </div>
       </header>
 
       <main class="stage">
+        <div class="page-heading"><div><p class="eyebrow">YOUR VOICE, IN WORDS</p><h1>Room for your thoughts.</h1></div><span class="workspace-tag">Dictation studio</span></div>
         <p id="model-status" class="model-status" role="status"></p>
+        <section class="paper" aria-label="Dictation transcript">
+        <div class="paper-toolbar"><span>TRANSCRIPT</span><div class="transcript-actions"><label class="check"><input id="original" type="checkbox" /> Original text</label><button type="button" id="copy" class="copy" hidden>Copy text</button></div></div>
         <div id="transcript" class="transcript" aria-live="polite" aria-relevant="additions text">
           <p class="empty" id="empty">
-            Hold the pedal and talk.
-            <span>A short pause settles the sentence.</span>
+            <span class="empty-symbol" aria-hidden="true">“</span>
+            Your next thought starts here.
+            <span>Click Start dictation and speak naturally.<br />Your words appear here as you talk.</span>
           </p>
         </div>
         <p id="live" class="live" hidden></p>
+        <div class="paper-footer"><span id="word-count">0 words</span><span>Live text appears in amber</span></div>
+        </section>
+        <p class="privacy-note">Audio is processed by your speech server. Smart cleanup sends text to OpenRouter when enabled.</p>
       </main>
 
       <footer class="dock">
+        <p id="activity" class="activity" role="status">Preparing your workspace</p>
         <div id="vu" class="vu" aria-hidden="true"></div>
         <button type="button" id="pedal" class="pedal" aria-pressed="false">
-          <span class="pedal-label" data-idle="Hold to speak" data-hot="Listening">Hold to speak</span>
+          <span class="pedal-label" data-idle="Start dictation" data-hot="Stop dictation">Start dictation</span>
         </button>
-        <p id="hint" class="hint">Space works too. Release, or pause, to lock the line.</p>
-        <button type="button" id="copy" class="copy" hidden>Copy transcript</button>
+        <p id="hint" class="hint">Click to start / stop <span aria-hidden="true">·</span> Hold <kbd>Space</kbd> to talk</p>
+        <p id="error" class="error" hidden role="alert"></p>
       </footer>
     </div>
 
     <p id="toast" class="toast" hidden role="status"></p>
-    <p id="error" class="error" hidden role="alert"></p>
-
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

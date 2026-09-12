@@ -1,0 +1,195 @@
+"""Protocol regression tests. Fake inference deliberately overlaps incoming messages."""
+import threading
+import time
+
+import pytest
+from fastapi.testclient import TestClient
+
+from backend import app as server
+from backend import asr
+
+
+class FakeSession:
+    instances = []
+
+    def __init__(self, lang='auto', profile='Balanced'):
+        self.pending = 0
+        self.full = ''
+        self.committed = ''
+        self.active = False
+        self.steps = 0
+        self.instances.append(self)
+
+    def add_pcm(self, data):
+        self.pending += len(data) // 2
+
+    def has_chunk(self):
+        return self.pending > 0
+
+    def consume_chunks(self, max_chunks=None):
+        assert not self.active
+        self.active = True
+        time.sleep(.02)
+        self.pending -= 1
+        self.steps += 1
+        self.full += ' word'
+        self.active = False
+        return self.snapshot()
+
+    def snapshot(self):
+        return {'full': self.full.strip(), 'live': self.full[len(self.committed):].strip(), 'detected_lang': 'en-US'}
+
+    def commit(self, force=False):
+        assert not self.active
+        text = self.full[len(self.committed):].strip()
+        self.committed = self.full
+        return text
+
+    def flush(self):
+        assert not self.active, 'flush raced with inference'
+        assert self.pending == 0, 'end lost queued audio'
+        return self.snapshot()
+
+
+@pytest.fixture
+def client(monkeypatch):
+    FakeSession.instances = []
+    monkeypatch.setattr(asr, 'LiveSession', FakeSession)
+    monkeypatch.setattr(server, 'runtime_status', lambda: {'status': 'ready'})
+    return TestClient(server.app)
+
+
+def start(ws, cleanup=False):
+    ws.send_json({'type': 'start', 'cleanup': cleanup})
+    assert ws.receive_json()['type'] == 'started'
+
+
+def until(ws, kind):
+    events = []
+    while True:
+        event = ws.receive_json()
+        events.append(event)
+        if event['type'] == kind:
+            return events
+
+
+def test_streams_before_end_and_restarts_without_id_collision(client):
+    with client.websocket_connect('/ws/transcribe') as ws:
+        assert ws.receive_json()['type'] == 'ready'
+        ids = []
+        for _ in range(3):
+            start(ws)
+            ws.send_bytes(b'\x00\x01' * 3)
+            first = ws.receive_json()
+            assert first['type'] == 'partial'
+            assert first['live'] == 'word'  # one partial per inference step
+            ws.send_json({'type': 'end'})
+            events = until(ws, 'ended')
+            ids.extend(e['id'] for e in events if e['type'] == 'commit')
+        assert ids == [1, 2, 3]
+        assert all(s.steps == 3 for s in FakeSession.instances)
+
+
+def test_commit_waits_for_pending_audio_and_keeps_short_utterance(client):
+    with client.websocket_connect('/ws/transcribe') as ws:
+        ws.receive_json()
+        start(ws)
+        ws.send_bytes(b'\x00\x01')
+        ws.send_json({'type': 'commit'})
+        events = until(ws, 'cleaned')
+        assert events[-1]['raw'] == 'word'
+        ws.send_json({'type': 'end'})
+        until(ws, 'ended')
+
+
+def test_cleanup_failure_preserves_raw_and_allows_restart(client, monkeypatch):
+    def fail(*args):
+        raise RuntimeError('provider failed')
+    monkeypatch.setattr(server, 'cleanup_span', fail)
+    with client.websocket_connect('/ws/transcribe') as ws:
+        ws.receive_json()
+        start(ws, cleanup=True)
+        ws.send_bytes(b'\x00\x01')
+        ws.send_json({'type': 'end'})
+        events = until(ws, 'ended')
+        assert any(e['type'] == 'warning' for e in events)
+        assert next(e for e in events if e['type'] == 'cleaned')['cleaned'] == 'word'
+        start(ws)
+        ws.send_json({'type': 'end'})
+        until(ws, 'ended')
+
+
+def test_duplicate_start_does_not_replace_session(client):
+    with client.websocket_connect('/ws/transcribe') as ws:
+        ws.receive_json()
+        start(ws)
+        ws.send_json({'type': 'start'})
+        assert ws.receive_json()['type'] == 'warning'
+        assert len(FakeSession.instances) == 1
+        ws.send_json({'type': 'end'})
+        until(ws, 'ended')
+
+
+def test_disconnect_releases_model_after_inference(client):
+    with client.websocket_connect('/ws/transcribe') as ws:
+        ws.receive_json()
+        start(ws)
+        ws.send_bytes(b'\x00\x01' * 2)
+        ws.receive_json()
+    assert not server.model_slot.locked()
+    with client.websocket_connect('/ws/transcribe') as ws:
+        ws.receive_json()
+        start(ws)
+        ws.send_json({'type': 'end'})
+        until(ws, 'ended')
+
+
+def test_pcm_queue_emits_one_step_and_rejects_backlog():
+    # Bypass GPU initialization to exercise the real PCM queue.
+    session = object.__new__(asr.LiveSession)
+    import numpy as np
+    session.pending = np.zeros(0, dtype=np.float32)
+    session._pcm_lock = threading.Lock()
+    session.chunk_samples = 2
+    session.snapshot = lambda: {}
+    chunks = []
+    session._infer = lambda audio, final: chunks.append(audio)
+    session.add_pcm(b'\x00\x40' * 4)
+    session.consume_chunks(1)
+    assert len(chunks) == 1
+    assert session.has_chunk()
+    assert chunks[0].tolist() == [.5, .5]
+    with pytest.raises(RuntimeError, match='cannot keep up'):
+        session.add_pcm(b'\0\0' * (16000 * 16))
+
+
+def test_busy_client_cannot_change_active_model(client):
+    with client.websocket_connect('/ws/transcribe') as first:
+        first.receive_json()
+        start(first)
+        with client.websocket_connect('/ws/transcribe') as second:
+            second.receive_json()
+            second.send_json({'type': 'start', 'language': 'hi-IN'})
+            assert 'Another recording' in second.receive_json()['message']
+        assert len(FakeSession.instances) == 1
+        first.send_json({'type': 'end'})
+        until(first, 'ended')
+
+
+def test_initialization_failure_releases_slot_for_retry(client, monkeypatch):
+    def fail(**kwargs):
+        raise RuntimeError('initialization failed')
+    monkeypatch.setattr(asr, 'LiveSession', fail)
+    with client.websocket_connect('/ws/transcribe') as ws:
+        ws.receive_json()
+        ws.send_json({'type': 'start'})
+        assert ws.receive_json()['type'] == 'error'
+        assert not server.model_slot.locked()
+        monkeypatch.setattr(asr, 'LiveSession', FakeSession)
+        start(ws)
+        ws.send_json({'type': 'end'})
+        until(ws, 'ended')
+
+
+def test_language_tags_are_removed_inside_and_after_text():
+    assert asr._split_nemotron_lang_tag('Hello. <en-US> Namaste. <hi-IN>') == ('Hello. Namaste.', 'hi-IN')

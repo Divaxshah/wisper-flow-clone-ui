@@ -5,23 +5,33 @@ class CaptureProcessor extends AudioWorkletProcessor {
     super();
     this._chunks = [];
     this._samples = 0;
-    this._target = Math.round(sampleRate * 0.16);
+    this._target = Math.round(sampleRate * 0.08);
+    this._stopped = false;
+    this.port.onmessage = (event) => {
+      if (event.data === "stop") {
+        this._stopped = true;
+        this.flush();
+        this.port.postMessage("stopped");
+      }
+    };
+  }
+  flush() {
+    if (!this._samples) return;
+    const out = new Float32Array(this._samples);
+    let offset = 0;
+    for (const chunk of this._chunks) { out.set(chunk, offset); offset += chunk.length; }
+    this.port.postMessage(out, [out.buffer]);
+    this._chunks = [];
+    this._samples = 0;
   }
   process(inputs) {
+    if (this._stopped) return true;
     const channel = inputs[0] && inputs[0][0];
     if (!channel || !channel.length) return true;
     this._chunks.push(Float32Array.from(channel));
     this._samples += channel.length;
     if (this._samples >= this._target) {
-      const out = new Float32Array(this._samples);
-      let offset = 0;
-      for (const chunk of this._chunks) {
-        out.set(chunk, offset);
-        offset += chunk.length;
-      }
-      this.port.postMessage(out, [out.buffer]);
-      this._chunks = [];
-      this._samples = 0;
+      this.flush();
     }
     return true;
   }
@@ -82,6 +92,7 @@ export async function startCapture(options: {
   onPcm: (bytes: ArrayBuffer) => void;
   onLevel: (values: number[]) => void;
   onPause: () => void;
+  onEnded?: () => void;
   pauseMs?: number;
 }): Promise<CaptureHandle> {
   const blocked = micUnavailableReason();
@@ -97,16 +108,22 @@ export async function startCapture(options: {
     },
   });
 
-  const context = new AudioContext();
+  let context: AudioContext;
+  try { context = new AudioContext({ sampleRate: TARGET_SR }); }
+  catch (error) { stream.getTracks().forEach(track => track.stop()); throw error; }
+  let moduleUrl: string | null = null;
+  try {
+  await context.resume();
   const source = context.createMediaStreamSource(stream);
   const analyser = context.createAnalyser();
   analyser.fftSize = 64;
   source.connect(analyser);
 
   const blob = new Blob([WORKLET], { type: "application/javascript" });
-  const url = URL.createObjectURL(blob);
-  await context.audioWorklet.addModule(url);
-  URL.revokeObjectURL(url);
+  moduleUrl = URL.createObjectURL(blob);
+  await context.audioWorklet.addModule(moduleUrl);
+  URL.revokeObjectURL(moduleUrl);
+  moduleUrl = null;
 
   const node = new AudioWorkletNode(context, "capture-processor");
   const mute = context.createGain();
@@ -134,7 +151,11 @@ export async function startCapture(options: {
   };
   raf = requestAnimationFrame(tick);
 
-  node.port.onmessage = (event: MessageEvent<Float32Array>) => {
+  let stopAck: (() => void) | null = null;
+  let stopping: Promise<void> | null = null;
+  stream.getAudioTracks().forEach(track => track.addEventListener("ended", () => options.onEnded?.()));
+  node.port.onmessage = (event: MessageEvent<Float32Array | string>) => {
+    if (typeof event.data === "string") { stopAck?.(); return; }
     const resampled = resampleTo16k(event.data, context.sampleRate);
     options.onPcm(floatToPcm16(resampled));
 
@@ -155,14 +176,28 @@ export async function startCapture(options: {
   };
 
   return {
-    stop: async () => {
+    stop: () => stopping ??= (async () => {
       cancelAnimationFrame(raf);
-      node.port.onmessage = null;
-      node.disconnect();
-      source.disconnect();
-      mute.disconnect();
-      stream.getTracks().forEach((track) => track.stop());
-      await context.close();
-    },
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const timer = window.setTimeout(() => reject(new Error("Microphone could not flush its final audio.")), 2000);
+          stopAck = () => { window.clearTimeout(timer); resolve(); };
+          node.port.postMessage("stop");
+        });
+      } finally {
+        node.port.onmessage = null;
+        node.disconnect();
+        source.disconnect();
+        mute.disconnect();
+        stream.getTracks().forEach(track => track.stop());
+        await context.close();
+      }
+    })(),
   };
+  } catch (error) {
+    if (moduleUrl) URL.revokeObjectURL(moduleUrl);
+    stream.getTracks().forEach(track => track.stop());
+    await context.close().catch(() => {});
+    throw error;
+  }
 }

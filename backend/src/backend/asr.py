@@ -49,7 +49,7 @@ NEMOTRON_CHUNK_PROFILES = {
     "Accurate": [56, 6],
     "Most accurate": [56, 13],
 }
-NEMOTRON_DEFAULT_CHUNK = "Lowest latency"
+NEMOTRON_DEFAULT_CHUNK = "Balanced"
 
 _model = None
 _model_error: str | None = None
@@ -72,6 +72,7 @@ def runtime_status() -> dict:
         "status": _status,
         "error": _model_error,
         "device": (_runtime or {}).get("label"),
+        "cleanup_available": bool(os.environ.get("OPENROUTER_API_KEY", "").strip()),
         "model": NEMOTRON_MODEL_ID,
         "languages": [{"label": label, "value": value} for label, value in NEMOTRON_LANG_CHOICES],
         "profiles": list(NEMOTRON_CHUNK_PROFILES.keys()),
@@ -157,10 +158,9 @@ def _extract_transcriptions(hypotheses) -> list[str]:
 
 
 def _split_nemotron_lang_tag(text: str) -> tuple[str, str]:
-    match = re.search(r"\s*<([a-z]{2}(?:-[A-Za-z]{2})?)>\s*$", text)
-    if not match:
-        return text.strip(), ""
-    return text[: match.start()].strip(), match.group(1)
+    pattern = r"<([a-z]{2}(?:-[A-Za-z]{2})?)>"
+    tags = re.findall(pattern, text)
+    return re.sub(r"\s+", " ", re.sub(pattern, "", text)).strip(), tags[-1] if tags else ""
 
 
 def _move_cache(value, device, dtype):
@@ -237,28 +237,36 @@ class LiveSession:
         self.cache_pre_encode = torch.zeros(
             (1, num_channels, self.pre_encode_cache_size), device=device, dtype=dtype
         )
+        # Centered STFT needs future samples; retain waveform context across chunks
+        # so chunk boundaries do not become artificial silence/reflect padding.
+        self.feature_lookahead = 320
+        self._wave_left = np.zeros(0, dtype=np.float32)
         self._stable_since = time.monotonic()
 
     def add_pcm(self, data: bytes) -> None:
         if not data or len(data) < 2:
             return
         usable = len(data) - (len(data) % 2)
-        samples = np.frombuffer(data[:usable], dtype=np.int16).astype(np.float32) / 32768.0
+        samples = np.frombuffer(data[:usable], dtype="<i2").astype(np.float32) / 32768.0
         with self._pcm_lock:
+            if len(self.pending) + len(samples) > TARGET_SR * 15:
+                raise RuntimeError("Audio processing cannot keep up. Try a faster device or shorter recording.")
             self.pending = np.concatenate([self.pending, samples])
 
     def has_chunk(self) -> bool:
         with self._pcm_lock:
-            return len(self.pending) >= self.chunk_samples
+            return len(self.pending) >= self.chunk_samples + getattr(self, "feature_lookahead", 0)
 
-    def consume_chunks(self) -> dict:
-        while True:
+    def consume_chunks(self, max_chunks: int | None = None) -> dict:
+        consumed = 0
+        while max_chunks is None or consumed < max_chunks:
             with self._pcm_lock:
-                if len(self.pending) < self.chunk_samples:
+                if len(self.pending) < self.chunk_samples + getattr(self, "feature_lookahead", 0):
                     break
-                chunk = self.pending[: self.chunk_samples].copy()
+                chunk = self.pending[: self.chunk_samples + getattr(self, "feature_lookahead", 0)].copy()
                 self.pending = self.pending[self.chunk_samples :]
             self._infer(chunk, final=False)
+            consumed += 1
         return self.snapshot()
 
     def feed_pcm16(self, data: bytes) -> dict:
@@ -276,9 +284,11 @@ class LiveSession:
             audio = np.concatenate(
                 [audio, np.zeros(self.chunk_samples - rem, dtype=np.float32)]
             )
-        for i in range(0, len(audio), self.chunk_samples):
-            last = i + self.chunk_samples >= len(audio)
-            self._infer(audio[i : i + self.chunk_samples], final=last)
+        total = len(audio)
+        audio = np.pad(audio, (0, self.feature_lookahead))
+        for i in range(0, total, self.chunk_samples):
+            last = i + self.chunk_samples >= total
+            self._infer(audio[i : i + self.chunk_samples + self.feature_lookahead], final=last)
         return self.snapshot()
 
     def live_span(self) -> str:
@@ -318,37 +328,48 @@ class LiveSession:
     def _infer(self, audio: np.ndarray, final: bool) -> None:
         import torch
 
+        with _lock, torch.inference_mode():
+            self._infer_step(audio, final)
+
+    def _infer_step(self, audio: np.ndarray, final: bool) -> None:
+        import torch
+
         model = self._model
         device = next(model.parameters()).device
-        audio_signal = torch.from_numpy(np.ascontiguousarray(audio)).unsqueeze(0).to(device)
-        audio_signal_len = torch.tensor([audio.shape[0]], device=device)
-        processed_signal, processed_signal_length = self._preprocessor(
-            input_signal=audio_signal, length=audio_signal_len
-        )
-        processed_signal = torch.cat([self.cache_pre_encode, processed_signal], dim=-1)
-        processed_signal_length = processed_signal_length + self.cache_pre_encode.size(-1)
+        left_samples = self._wave_left.size
+        waveform = np.concatenate([self._wave_left, audio])
+        audio_signal = torch.from_numpy(waveform).unsqueeze(0).to(device)
+        audio_signal_len = torch.tensor([waveform.size], device=device)
+        features, _ = self._preprocessor(input_signal=audio_signal, length=audio_signal_len)
+        # Keep exactly the new 10 ms feature frames. The centered STFT emits an
+        # extra boundary frame, which must not enter the encoder or its cache.
+        begin = left_samples // 160
+        frames = self.chunk_samples // 160
+        features = features[:, :, begin : begin + frames]
+        self._wave_left = waveform[: left_samples + self.chunk_samples][-640:].copy()
+        processed_signal = torch.cat([self.cache_pre_encode, features], dim=-1)
+        processed_signal_length = torch.tensor([processed_signal.size(-1)], device=device)
         self.cache_pre_encode = processed_signal[:, :, -self.pre_encode_cache_size :].clone()
 
-        with _lock, torch.inference_mode():
-            (
-                self.previous_pred_out,
-                transcribed_texts,
-                self.cache_last_channel,
-                self.cache_last_time,
-                self.cache_last_channel_len,
-                self.previous_hypotheses,
-            ) = model.conformer_stream_step(
-                processed_signal=processed_signal,
-                processed_signal_length=processed_signal_length,
-                cache_last_channel=self.cache_last_channel,
-                cache_last_time=self.cache_last_time,
-                cache_last_channel_len=self.cache_last_channel_len,
-                keep_all_outputs=final,
-                previous_hypotheses=self.previous_hypotheses,
-                previous_pred_out=self.previous_pred_out,
-                drop_extra_pre_encoded=None,
-                return_transcription=True,
-            )
+        (
+            self.previous_pred_out,
+            transcribed_texts,
+            self.cache_last_channel,
+            self.cache_last_time,
+            self.cache_last_channel_len,
+            self.previous_hypotheses,
+        ) = model.conformer_stream_step(
+            processed_signal=processed_signal,
+            processed_signal_length=processed_signal_length,
+            cache_last_channel=self.cache_last_channel,
+            cache_last_time=self.cache_last_time,
+            cache_last_channel_len=self.cache_last_channel_len,
+            keep_all_outputs=final,
+            previous_hypotheses=self.previous_hypotheses,
+            previous_pred_out=self.previous_pred_out,
+            drop_extra_pre_encoded=None,
+            return_transcription=True,
+        )
         raw = _extract_transcriptions(transcribed_texts)[0]
         text, lang = _split_nemotron_lang_tag(raw)
         if text != self.full_text:
@@ -365,6 +386,7 @@ def load_dotenv_files() -> None:
     here = Path(__file__).resolve()
     for env_file in (
         here.parents[2] / ".env",
+        here.parents[3] / ".env",
         here.parents[4] / ".env",
         here.parents[4] / "src" / "wisper_flow_clone" / ".env",
         Path.cwd() / ".env",

@@ -13,9 +13,10 @@ export type ServerEvent =
   | { type: "partial"; full: string; live: string; detected_lang: string }
   | { type: "commit"; id: number; raw: string }
   | { type: "cleaned"; id: number; raw: string; cleaned: string }
-  | { type: "error"; message: string };
+  | { type: "error" | "warning"; message: string };
 
 export type StatusPayload = {
+  cleanup_available: boolean;
   status: string;
   error: string | null;
   device: string | null;
