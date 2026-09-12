@@ -15,7 +15,7 @@ export type ServerEvent =
       type: "commit";
       id: number;
       raw: string;
-      cleanup_status?: "pending" | "skipped";
+      cleanup_status?: "pending" | "deferred" | "skipped";
     }
   | {
       type: "cleaned";
@@ -23,6 +23,14 @@ export type ServerEvent =
       raw: string;
       cleaned: string;
       cleanup_status?: "applied" | "skipped" | "failed";
+    }
+  | { type: "polishing"; ids: number[]; raw: string }
+  | {
+      type: "polished";
+      ids: number[];
+      raw: string;
+      cleaned: string;
+      cleanup_status: "applied" | "failed";
     }
   | { type: "error" | "warning"; message: string };
 

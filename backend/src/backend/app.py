@@ -1,4 +1,4 @@
-"""Realtime Nemotron ASR + pause-delimited sentence cleanup."""
+"""Realtime Nemotron ASR with coalesced live cleanup of the recording so far."""
 
 from __future__ import annotations
 
@@ -52,38 +52,62 @@ async def transcribe_socket(ws: WebSocket) -> None:
     session = None
     owns_slot = False
     drain_task = None
-    cleanup_task = None
     sentence_id = 0
-    prior_cleaned: list[str] = []
+    recording_ids: list[int] = []
     cleanup_enabled = False
+    cleanup_task = None
+    pending_polish = None
+    polish_revision = 0
+    last_requested_raw = ""
 
     async def send(payload: dict) -> None:
         await ws.send_json(payload)
 
-    async def clean_after(previous, sid, raw):
-        if previous:
-            await previous
-        cleanup_status = "applied"
-        try:
-            cleaned = await asyncio.to_thread(cleanup_span, raw, " ".join(prior_cleaned[-3:]))
-        except Exception:
-            cleanup_status = "failed"
-            cleaned = raw
-            await send({"type": "warning", "message": "Text cleanup is unavailable. Your original transcript has been kept."})
-        prior_cleaned.append(cleaned)
-        await send({"type": "cleaned", "id": sid, "raw": raw, "cleaned": cleaned, "cleanup_status": cleanup_status})
-
     async def commit(force=False):
-        nonlocal sentence_id, cleanup_task
+        nonlocal sentence_id
         raw = session.commit(force=force)
         if not raw:
             return
         sentence_id += 1
-        await send({"type": "commit", "id": sentence_id, "raw": raw, "cleanup_status": "pending" if cleanup_enabled else "skipped"})
-        if cleanup_enabled:
-            cleanup_task = asyncio.create_task(clean_after(cleanup_task, sentence_id, raw))
-        else:
-            await send({"type": "cleaned", "id": sentence_id, "raw": raw, "cleaned": raw, "cleanup_status": "skipped"})
+        recording_ids.append(sentence_id)
+        await send({"type": "commit", "id": sentence_id, "raw": raw,
+                    "cleanup_status": "deferred" if cleanup_enabled else "skipped"})
+        if not cleanup_enabled:
+            await send({"type": "cleaned", "id": sentence_id, "raw": raw,
+                        "cleaned": raw, "cleanup_status": "skipped"})
+
+    async def polish_worker():
+        nonlocal pending_polish
+        while pending_polish is not None:
+            revision, raw, ids = pending_polish
+            pending_polish = None
+            await send({"type": "polishing", "ids": ids, "raw": raw, "revision": revision})
+            try:
+                cleaned = await asyncio.to_thread(cleanup_span, raw)
+                result = "applied"
+            except Exception:
+                cleaned = raw
+                result = "failed"
+            # Newer pause snapshots supersede unfinished edits. Never append or
+            # show an old response after a newer correction has been requested.
+            if revision != polish_revision:
+                continue
+            await send({"type": "polished", "ids": ids, "raw": raw,
+                        "cleaned": cleaned, "cleanup_status": result, "revision": revision})
+            if result == "failed":
+                await send({"type": "warning", "message": "Could not safely polish this passage. Your original words have been kept."})
+
+    def request_polish(raw: str):
+        nonlocal cleanup_task, pending_polish, polish_revision, last_requested_raw
+        if not raw.strip() or not recording_ids or raw == last_requested_raw:
+            return
+        last_requested_raw = raw
+        polish_revision += 1
+        # One provider call at a time, plus only the newest waiting snapshot.
+        # Inputs are canonical raw ASR text, never prior generated text.
+        pending_polish = (polish_revision, raw, list(recording_ids))
+        if cleanup_task is None or cleanup_task.done():
+            cleanup_task = asyncio.create_task(polish_worker())
 
     async def drain_audio():
         try:
@@ -135,7 +159,10 @@ async def transcribe_socket(ws: WebSocket) -> None:
                         traceback.print_exc()
                         continue
                     cleanup_enabled = bool(payload.get("cleanup", True))
-                    prior_cleaned = []
+                    recording_ids = []
+                    pending_polish = None
+                    last_requested_raw = ""
+                    polish_revision = 0
                     await send({"type": "started"})
                 elif kind in ("commit", "end") and session is not None:
                     # Never flush or commit concurrently with an inference step.
@@ -144,6 +171,8 @@ async def transcribe_socket(ws: WebSocket) -> None:
                         drain_task = None
                     if kind == "commit":
                         await commit(force=True)
+                        if cleanup_enabled:
+                            request_polish(session.snapshot()["full"])
                     else:
                         snap = await anyio.to_thread.run_sync(session.flush)
                         await send({"type": "partial", **snap})
@@ -151,9 +180,11 @@ async def transcribe_socket(ws: WebSocket) -> None:
                         session = None
                         model_slot.release()
                         owns_slot = False
-                        if cleanup_task:
-                            await cleanup_task
-                            cleanup_task = None
+                        if cleanup_enabled:
+                            request_polish(snap["full"])
+                            if cleanup_task:
+                                await cleanup_task
+                                cleanup_task = None
                         await send({"type": "ended"})
                 continue
             data = message.get("bytes")
@@ -174,15 +205,17 @@ async def transcribe_socket(ws: WebSocket) -> None:
             pass
     finally:
         # Thread work cannot be cancelled safely; let it finish before releasing the model.
+        if cleanup_task:
+            cleanup_task.cancel()
         with anyio.CancelScope(shield=True):
+            if cleanup_task:
+                await asyncio.gather(cleanup_task, return_exceptions=True)
             try:
                 if drain_task:
                     await asyncio.gather(drain_task, return_exceptions=True)
             finally:
                 if owns_slot:
                     model_slot.release()
-            if cleanup_task:
-                await asyncio.gather(cleanup_task, return_exceptions=True)
 
 
 frontend_dist = Path(__file__).resolve().parents[3] / "frontend" / "dist"

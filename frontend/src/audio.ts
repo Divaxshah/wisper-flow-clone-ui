@@ -98,7 +98,7 @@ export async function startCapture(options: {
   const blocked = micUnavailableReason();
   if (blocked) throw new Error(blocked);
 
-  const pauseMs = options.pauseMs ?? 900;
+  const pauseMs = options.pauseMs ?? 1600;
   const stream = await navigator.mediaDevices.getUserMedia({
     audio: {
       channelCount: 1,

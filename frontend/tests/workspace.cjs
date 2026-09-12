@@ -201,11 +201,71 @@ const assert = require("node:assert/strict");
           path: `${process.env.SCREENSHOT_DIR}/wisper-new-mobile.png`,
         });
     }
+    // Whole-recording polishing must replace all fragments, be idempotent,
+    // preserve exact raw text, and leave previous recordings untouched.
+    const ids = Array.from({ length: 46 }, (_, i) => i + 1);
+    const fullRaw = "Can you help me solve what is one plus one\nplease\n?";
+    const polished = "Can you help me solve what is one plus one, please?";
+    send({ type: "polishing", ids, raw: fullRaw });
+    await page.waitForFunction(
+      () => document.querySelector("#cleanup-status").dataset.state === "pending",
+    );
+    assert.equal(await page.locator(".sentence").count(), 46);
+    send({ type: "partial", full: "", live: "Still speaking while polishing.", detected_lang: "" });
+    assert.match(
+      await page.locator("#cleanup-status").textContent(),
+      /Polishing/,
+    );
+    send({
+      type: "polished",
+      ids,
+      raw: fullRaw,
+      cleaned: polished,
+      cleanup_status: "applied",
+    });
+    send({
+      type: "polished",
+      ids,
+      raw: fullRaw,
+      cleaned: polished,
+      cleanup_status: "applied",
+    });
+    await page.waitForFunction(
+      () =>
+        document.querySelector(".sentence").textContent ===
+        "Can you help me solve what is one plus one, please?",
+    );
+    assert.equal(await page.locator(".sentence").count(), 1);
+    assert.equal(await page.locator("#live").textContent(), "Still speaking while polishing.");
+    assert.equal(await page.locator("#live").isVisible(), true);
+    await page.locator("#view-original").click();
+    assert.equal(await page.locator(".sentence").textContent(), fullRaw);
+    await page.locator("#view-polished").click();
     await page.locator("#pedal").click();
     await page.waitForFunction(() => document.body.dataset.phase === "idle");
     await page.locator("#pedal").click();
     await page.waitForFunction(
       () => document.body.dataset.phase === "listening",
+    );
+    send({
+      type: "commit",
+      id: 1,
+      raw: "Another recording.",
+      cleanup_status: "deferred",
+    });
+    send({
+      type: "polished",
+      ids: [1],
+      raw: "Another recording.",
+      cleaned: "Another recording.",
+      cleanup_status: "applied",
+    });
+    await page.waitForFunction(
+      () => document.querySelectorAll(".sentence").length === 2,
+    );
+    assert.equal(
+      await page.locator(".sentence").first().textContent(),
+      polished,
     );
     await page.locator("#pedal").click();
     await page.waitForFunction(() => document.body.dataset.phase === "idle");

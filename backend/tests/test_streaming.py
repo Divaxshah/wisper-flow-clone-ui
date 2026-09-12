@@ -113,7 +113,7 @@ def test_cleanup_failure_preserves_raw_and_allows_restart(client, monkeypatch):
         ws.send_json({'type': 'end'})
         events = until(ws, 'ended')
         assert any(e['type'] == 'warning' for e in events)
-        assert next(e for e in events if e['type'] == 'cleaned')['cleaned'] == 'word'
+        assert next(e for e in events if e['type'] == 'polished')['cleaned'] == 'word'
         start(ws)
         ws.send_json({'type': 'end'})
         until(ws, 'ended')
@@ -193,3 +193,65 @@ def test_initialization_failure_releases_slot_for_retry(client, monkeypatch):
 
 def test_language_tags_are_removed_inside_and_after_text():
     assert asr._split_nemotron_lang_tag('Hello. <en-US> Namaste. <hi-IN>') == ('Hello. Namaste.', 'hi-IN')
+
+
+def test_cleanup_arrives_live_and_stop_does_not_repeat_unchanged_work(client, monkeypatch):
+    calls = []
+    def clean(raw):
+        calls.append(raw)
+        return raw
+    monkeypatch.setattr(server, 'cleanup_span', clean)
+    with client.websocket_connect('/ws/transcribe') as ws:
+        ws.receive_json()
+        for recording in range(2):
+            start(ws, cleanup=True)
+            ids = []
+            for pause in range(3):
+                ws.send_bytes(b'\0\1')
+                ws.send_json({'type': 'commit'})
+                events = until(ws, 'polished')
+                ids.append(next(e for e in events if e['type'] == 'commit')['id'])
+                result = events[-1]
+                assert result['ids'] == ids
+                assert result['raw'] == ' '.join(['word'] * (pause + 1))
+                assert result['cleaned'] == result['raw']
+                assert all(e['type'] != 'ended' for e in events)
+            ws.send_json({'type': 'end'})
+            events = until(ws, 'ended')
+            assert not any(e['type'] == 'polished' for e in events)
+    assert calls == ['word', 'word word', 'word word word'] * 2
+
+
+def test_slow_cleanup_does_not_block_audio_and_coalesces_newer_pauses(client, monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+    calls = []
+    def clean(raw):
+        calls.append(raw)
+        if len(calls) == 1:
+            entered.set()
+            assert release.wait(5)
+        return raw
+    monkeypatch.setattr(server, 'cleanup_span', clean)
+    try:
+        with client.websocket_connect('/ws/transcribe') as ws:
+            ws.receive_json()
+            start(ws, cleanup=True)
+            ws.send_bytes(b'\0\1')
+            ws.send_json({'type': 'commit'})
+            until(ws, 'polishing')
+            assert entered.wait(2)
+            for _ in range(2):
+                ws.send_bytes(b'\0\1')
+                ws.send_json({'type': 'commit'})
+                events = until(ws, 'commit')
+                assert any(e['type'] == 'partial' for e in events)
+            release.set()
+            events = until(ws, 'polished')
+            assert events[-1]['raw'] == 'word word word'
+            assert events[-1]['revision'] == 3
+            assert calls == ['word', 'word word word']
+            ws.send_json({'type': 'end'})
+            until(ws, 'ended')
+    finally:
+        release.set()

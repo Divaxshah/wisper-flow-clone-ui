@@ -235,12 +235,14 @@ function updateWords() {
     : originalEl.checked
       ? "Original words · no edits"
       : failed
-        ? "Some text kept original · cleanup unavailable"
+        ? "Original kept · cleanup could not be applied"
         : rows.some((el) => el.dataset.cleanup === "applied")
           ? "Polished · original always available"
-          : text
-            ? "Original words preserved"
-            : "Ready for your first thought";
+          : rows.some((el) => el.dataset.cleanup === "deferred")
+            ? "Live words · polishing after a pause"
+            : text
+              ? "Original words preserved"
+              : "Ready for your first thought";
 }
 
 function renderSentence(el: HTMLElement) {
@@ -390,6 +392,32 @@ function sentenceEl(id: number): HTMLElement {
 }
 
 function onEvent(event: ServerEvent) {
+  if (event.type === "polishing" || event.type === "polished") {
+    if (!event.ids.length) return;
+    if (event.type === "polishing") {
+      // Keep the last polished version visible while the next pass runs.
+      for (const id of event.ids) {
+        const row = transcriptEl.querySelector<HTMLElement>(`[data-id="${sessionNumber}-${id}"]`);
+        if (row) row.dataset.cleanup = "pending";
+      }
+      updateWords();
+      return;
+    }
+    // Replace only this snapshot's committed prefix. Speech received while
+    // cleanup was running remains visible in the live suffix and later rows.
+    const first = sentenceEl(event.ids[0]);
+    for (const id of event.ids.slice(1)) {
+      transcriptEl
+        .querySelector(`[data-id="${sessionNumber}-${id}"]`)
+        ?.remove();
+    }
+    first.dataset.raw = event.raw;
+    first.dataset.cleaned = event.cleaned;
+    first.dataset.cleanup = event.cleanup_status;
+    first.dataset.state = "settled";
+    renderSentence(first);
+    return;
+  }
   if (event.type === "started") {
     startAck?.resolve();
     startAck = null;
@@ -505,7 +533,7 @@ async function startListening() {
             vuBars[i].style.transform =
               `scaleY(${Math.max(0.08, Math.min(1, value * 3))})`;
         }),
-      pauseMs: 900,
+      pauseMs: 1600,
       onPause: () => {
         if (socket === ws && ws.readyState === WebSocket.OPEN)
           ws.send(JSON.stringify({ type: "commit" }));
@@ -590,7 +618,7 @@ async function loadStatus() {
       : "Set OPENROUTER_API_KEY on the server to enable cleanup";
     document.querySelector<HTMLElement>("#cleanup-help")!.textContent =
       data.cleanup_available
-        ? "Your original is always kept."
+        ? "Polished after a pause. Your original is kept."
         : "Unavailable · add a cleanup key on your server.";
     statusLoaded = true;
     buildProfiles();

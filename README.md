@@ -1,6 +1,6 @@
 # Wisper live dictation
 
-Cache-aware Nemotron ASR streams text while you speak. Optional smart cleanup removes fillers and clear self-corrections after a 900 ms pause. Original text is always available in the transcript view.
+Cache-aware Nemotron ASR streams text while you speak. Optional smart cleanup removes fillers and clear self-corrections while you record, after approximately 1.6 seconds of silence. Original text is always available in the transcript view.
 
 ## Run locally
 
@@ -44,7 +44,7 @@ Set `OPENROUTER_API_KEY` in a `.env` at this repository's root or in `backend/`.
 - The server publishes a partial after each model step. Pause commits and final flush wait for queued inference, so they cannot mutate caches concurrently.
 - One active recording per backend process is supported because NeMo has shared mutable model configuration. Concurrent clients receive a retry message.
 - Audio backlog is bounded. A slow or interrupted connection reports an error and preserves text already received, but does not replay lost audio.
-- Pause detection currently uses an energy threshold, not a trained voice activity model. Cleanup operates on pause-delimited spans, so corrections across previously committed spans are not rewritten.
+- Pause detection currently uses an energy threshold, not a trained voice activity model. After a 1.6-second pause, cleanup uses the canonical raw transcript of the recording so far, so corrections across pauses can be resolved. It runs in the background while audio and partial text continue streaming. Earlier recordings remain unchanged.
 
 ## Checks
 
@@ -81,7 +81,7 @@ Restart the backend; it serves `frontend/dist` at http://127.0.0.1:8000. This is
 
 The workspace now has an internally scrolling transcript and a persistent recording bar. It follows live text only while you are at the bottom; **Back to live text** resumes following after you scroll up. The **Original / Polished** control preserves both versions. A status below the document distinguishes pending cleanup, applied cleanup, and a fallback to original wording.
 
-Cleanup is instructed to retain complete sentences and speech intent rather than summarize text into topic labels. Empty, refused, and incomplete provider responses preserve the original text and report a failure. Cleanup still operates per pause-delimited span and cannot revise earlier spans.
+Cleanup is instructed to retain complete sentences and speech intent rather than summarize text into topic labels. Empty, refused, and incomplete provider responses preserve the original text and report a failure. Cleanup runs after longer pauses using the recording so far, without any previous generated text. One request runs at a time, and only the newest waiting snapshot is kept. Superseded responses are discarded. Results replace only their committed prefix; newer live words stay visible. Stopping flushes remaining audio and waits for the latest required pass, without repeating unchanged work. A conservative output check rejects new vocabulary, unsupported symbols, and added word repetitions; rejected output leaves the full original recording visible. This is a guardrail, not a guarantee of semantic equivalence, and can reject otherwise reasonable paraphrases.
 
 ```bash
 # Run Vite in a separate terminal, then from frontend/:
@@ -94,4 +94,4 @@ CHROME_PATH=/usr/bin/google-chrome npm run test:ui
 PYTHONPATH=backend/src python backend/tests/smoke_cleanup.py
 ```
 
-The browser suite mocks ASR and uses synthetic microphone audio to check layout stability with long transcripts, 320/390 px mobile layouts, language and recognition controls, cleanup status, original/polished switching, and recording restart. The optional cleanup smoke test sends five public fixtures to the configured model and incurs API usage; read its outputs to assess meaning preservation.
+The browser suite mocks ASR and uses synthetic microphone audio to check layout stability with long transcripts, 320/390 px mobile layouts, language and recognition controls, cleanup status, original/polished switching, and recording restart. The optional cleanup smoke test sends public regression fixtures to the configured model and incurs API usage; read its outputs to assess meaning preservation.
