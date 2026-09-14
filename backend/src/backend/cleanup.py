@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import unicodedata
 from collections import Counter
 from dotenv import load_dotenv
 
@@ -44,6 +45,8 @@ Use punctuation and capitalization without inventing new wording. No preamble,
 quotation marks wrapping the output, markdown fences, or commentary."""
 
 CLEANUP_FEW_SHOT = [
+    ("मुझे उम इस इस प्रोजेक्ट के बारे में बात करनी है", "मुझे इस प्रोजेक्ट के बारे में बात करनी है।"),
+    ("यह model अच्छा है um लेकिन response slow है", "यह model अच्छा है, लेकिन response slow है।"),
     ("My name is Divatsh. My name is Divaks. Can you help me solve what is one plus one\nplease\n? What's up with all these text that you are giving me\n? Smiling emoji, smiling emoji, smiling emoji",
      "My name is Divaks. Can you help me solve what is one plus one, please? What's up with all these text that you are giving me? 😊😊😊"),
     ("Could you send the report\nplease\n?", "Could you send the report, please?"),
@@ -73,7 +76,7 @@ EMOJI_COMMANDS = {"smiling emoji": "😊", "smile emoji": "😊", "thumbs up emo
 
 
 def _tokens(text: str) -> Counter:
-    text = text.casefold().replace("’", "'")
+    text = unicodedata.normalize("NFC", text).casefold().replace("’", "'")
     # Equivalent written forms, without allowing arbitrary paraphrases.
     contractions = {"what's": "what is", "let's": "let us", "i'm": "i am", "don't": "do not", "can't": "can not", "it's": "it is", "you're": "you are", "that's": "that is"}
     for source, expanded in contractions.items():
@@ -83,7 +86,24 @@ def _tokens(text: str) -> Counter:
         text = re.sub(r"\b" + word + r"\b", str(number), text)
     text = text.replace("+", " plus ").replace("&", " and ")
     text = re.sub(r"(?<=\d),(?=\d)", "", text)
-    return Counter(re.findall(r"[^\W_]+(?:'[^\W_]+)?", text, flags=re.UNICODE))
+    # Python's \w excludes combining marks: splitting on it breaks Hindi
+    # matras/nukta (and many other scripts) into unrelated consonant fragments.
+    words = []
+    current = []
+    for char in text:
+        if unicodedata.category(char)[0] in "LMN" or (char == "'" and current):
+            current.append(char)
+        elif current:
+            words.append("".join(current).rstrip("'"))
+            current = []
+    if current:
+        words.append("".join(current).rstrip("'"))
+    hindi_numbers = {"शून्य": "0", "एक": "1", "दो": "2", "तीन": "3", "चार": "4", "पाँच": "5", "पांच": "5", "छह": "6", "सात": "7", "आठ": "8", "नौ": "9", "दस": "10"}
+    return Counter(hindi_numbers.get(word, "".join(str(unicodedata.decimal(c)) if c.isdecimal() else c for c in word)) for word in words)
+
+
+class CleanupValidationError(ValueError):
+    """A public-safe reason an edit was rejected; never contains transcript text."""
 
 
 def validate_cleanup(raw: str, cleaned: str) -> None:
@@ -95,7 +115,7 @@ def validate_cleanup(raw: str, cleaned: str) -> None:
     available = _tokens(raw)
     emitted = _tokens(cleaned)
     if emitted - available:
-        raise ValueError("Cleanup introduced unsupported or repeated words.")
+        raise CleanupValidationError("Cleanup introduced unsupported or repeated words.")
     # Emoji conversion is allowed only when present or explicitly requested.
     for command, emoji in EMOJI_COMMANDS.items():
         if emoji not in cleaned:
@@ -103,12 +123,16 @@ def validate_cleanup(raw: str, cleaned: str) -> None:
         aliases = [phrase for phrase, symbol in EMOJI_COMMANDS.items() if symbol == emoji]
         requests = sum(len(re.findall(r"\b" + phrase + r"\b", raw, re.I)) for phrase in aliases)
         if cleaned.count(emoji) != raw.count(emoji) + requests:
-            raise ValueError("Cleanup introduced unsupported emoji.")
-    raw_symbols = set(re.findall(r"[^\w\s.,!?;:'\"()—–+&/\-]", raw))
+            raise CleanupValidationError("Cleanup introduced unsupported emoji.")
+    def symbols(text):
+        # Unicode punctuation (including Hindi danda), letters and their marks
+        # are writing, not invented emoji/symbols. NFC also handles nukta forms.
+        return {c for c in unicodedata.normalize("NFC", text)
+                if unicodedata.category(c)[0] == "S" and c not in "+&"}
+    raw_symbols = symbols(raw)
     allowed_symbols = set("".join(emoji for command, emoji in EMOJI_COMMANDS.items() if re.search(r"\b" + command + r"\b", raw, re.I)))
-    for symbol in re.findall(r"[^\w\s.,!?;:'\"()—–+&/\-]", cleaned):
-        if symbol not in raw_symbols and symbol not in allowed_symbols:
-            raise ValueError("Cleanup introduced unsupported symbols.")
+    if symbols(cleaned) - raw_symbols - allowed_symbols:
+        raise CleanupValidationError("Cleanup introduced unsupported symbols.")
 
 
 def cleanup_span(raw: str) -> str:

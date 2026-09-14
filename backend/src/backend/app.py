@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import time
+import uuid
+import numpy as np
 import traceback
 import anyio
 from functools import partial
@@ -15,7 +19,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from backend.asr import load_dotenv_files, load_model_in_background, runtime_status
-from backend.cleanup import cleanup_span
+from backend.cleanup import cleanup_span, CleanupValidationError
+
+logger = logging.getLogger("uvicorn.error")
 
 load_dotenv_files()
 
@@ -59,6 +65,13 @@ async def transcribe_socket(ws: WebSocket) -> None:
     pending_polish = None
     polish_revision = 0
     last_requested_raw = ""
+    trace_id = uuid.uuid4().hex[:8]
+    started_at = 0.0
+    audio_received = 0
+    inference_steps = 0
+    inference_seconds = 0.0
+    first_text_seen = False
+    first_signal_seen = False
 
     async def send(payload: dict) -> None:
         await ws.send_json(payload)
@@ -82,12 +95,22 @@ async def transcribe_socket(ws: WebSocket) -> None:
             revision, raw, ids = pending_polish
             pending_polish = None
             await send({"type": "polishing", "ids": ids, "raw": raw, "revision": revision})
+            cleanup_started = time.monotonic()
+            failure_reason = ""
             try:
                 cleaned = await asyncio.to_thread(cleanup_span, raw)
                 result = "applied"
-            except Exception:
+            except Exception as exc:
                 cleaned = raw
                 result = "failed"
+                if isinstance(exc, CleanupValidationError):
+                    failure_reason = str(exc)  # Our validator messages contain no transcript.
+                elif getattr(exc, "status_code", None):
+                    failure_reason = f"Provider HTTP {exc.status_code}"
+                else:
+                    failure_reason = type(exc).__name__
+                logger.warning("cleanup_failed session=%s revision=%s reason=%s elapsed_ms=%.0f input_chars=%s",
+                               trace_id, revision, failure_reason, (time.monotonic()-cleanup_started)*1000, len(raw))
             # Newer pause snapshots supersede unfinished edits. Never append or
             # show an old response after a newer correction has been requested.
             if revision != polish_revision:
@@ -95,7 +118,7 @@ async def transcribe_socket(ws: WebSocket) -> None:
             await send({"type": "polished", "ids": ids, "raw": raw,
                         "cleaned": cleaned, "cleanup_status": result, "revision": revision})
             if result == "failed":
-                await send({"type": "warning", "message": "Could not safely polish this passage. Your original words have been kept."})
+                await send({"type": "warning", "message": f"Polishing failed ({failure_reason}). Your original words have been kept."})
 
     def request_polish(raw: str):
         nonlocal cleanup_task, pending_polish, polish_revision, last_requested_raw
@@ -110,9 +133,21 @@ async def transcribe_socket(ws: WebSocket) -> None:
             cleanup_task = asyncio.create_task(polish_worker())
 
     async def drain_audio():
+        nonlocal inference_steps, inference_seconds, first_text_seen
         try:
             while session is not None and session.has_chunk():
+                began = time.monotonic()
                 snap = await anyio.to_thread.run_sync(session.consume_chunks, 1)
+                step_seconds = time.monotonic() - began
+                inference_seconds += step_seconds
+                inference_steps += 1
+                if inference_steps == 1 or (snap["full"] and not first_text_seen):
+                    stage = "first_text" if snap["full"] else "first_inference"
+                    logger.info("asr_timing session=%s stage=%s elapsed_ms=%.0f step_ms=%.0f received_audio_ms=%.0f steps=%s inference_ms=%.0f",
+                                trace_id, stage, (time.monotonic()-started_at)*1000, step_seconds*1000,
+                                audio_received/32, inference_steps, inference_seconds*1000)
+                if snap["full"]:
+                    first_text_seen = True
                 await send({"type": "partial", **snap})
         except Exception:
             await send({"type": "error", "message": "Audio processing failed. Please start a new recording."})
@@ -163,6 +198,14 @@ async def transcribe_socket(ws: WebSocket) -> None:
                     pending_polish = None
                     last_requested_raw = ""
                     polish_revision = 0
+                    started_at = time.monotonic()
+                    audio_received = 0
+                    inference_steps = 0
+                    inference_seconds = 0.0
+                    first_text_seen = False
+                    first_signal_seen = False
+                    trace_id = uuid.uuid4().hex[:8]
+                    logger.info("asr_started session=%s language=%s profile=%s", trace_id, payload.get("language", "auto"), payload.get("profile", "Balanced"))
                     await send({"type": "started"})
                 elif kind in ("commit", "end") and session is not None:
                     # Never flush or commit concurrently with an inference step.
@@ -189,6 +232,16 @@ async def transcribe_socket(ws: WebSocket) -> None:
                 continue
             data = message.get("bytes")
             if data and session is not None:
+                if not audio_received:
+                    logger.info("asr_timing session=%s stage=first_audio elapsed_ms=%.0f", trace_id, (time.monotonic()-started_at)*1000)
+                audio_received += len(data)
+                if not first_signal_seen and len(data) >= 2:
+                    pcm = np.frombuffer(data[:len(data) - len(data) % 2], dtype="<i2").astype(np.float32) / 32768
+                    rms = float(np.sqrt(np.mean(pcm * pcm)))
+                    if rms > 0.018:
+                        first_signal_seen = True
+                        logger.info("asr_timing session=%s stage=first_signal elapsed_ms=%.0f rms=%.4f",
+                                    trace_id, (time.monotonic()-started_at)*1000, rms)
                 session.add_pcm(data)
                 if drain_task is None or drain_task.done():
                     if drain_task:

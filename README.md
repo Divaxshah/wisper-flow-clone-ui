@@ -96,3 +96,13 @@ PYTHONPATH=backend/src python backend/tests/smoke_cleanup.py
 ```
 
 The browser suite mocks ASR and uses synthetic microphone audio to check layout stability with long transcripts, 320/390 px mobile layouts, language and recognition controls, cleanup status, original/polished switching, and recording restart. The optional cleanup smoke test sends public regression fixtures to the configured model and incurs API usage; read its outputs to assess meaning preservation.
+
+## Diagnosing latency and cleanup failures
+
+The backend logs `asr_started` and `asr_timing` with a short per-recording session ID. Times are measured from the server's `started` acknowledgement:
+
+- `first_audio`: first PCM packet received; a late arrival points to microphone startup or transport.
+- `first_signal`: first packet above the energy threshold (not a speech classifier). A late signal after early packets may mean initial silence or microphone behavior.
+- `first_inference` / `first_text`: first model step and first nonempty result. `step_ms`, `inference_ms`, `steps`, and `received_audio_ms` help distinguish compute cost from waiting for sufficient speech. These logs do not measure browser rendering latency.
+
+`cleanup_failed` includes a safe validation reason, provider HTTP status, or exception class, plus duration and input length. It does not log transcript contents or credentials. Hindi combining marks, danda punctuation, and canonically equivalent nukta forms are supported by the validator. The guard is still conservative; genuine rewording can be rejected, retaining original text.

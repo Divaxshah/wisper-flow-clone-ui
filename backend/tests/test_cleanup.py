@@ -107,3 +107,26 @@ def test_provider_hallucination_is_not_returned(monkeypatch):
     provider(monkeypatch, USER_BAD)
     with pytest.raises(ValueError):
         cleanup_span(USER_RAW)
+
+
+@pytest.mark.parametrize('raw,cleaned', [
+    ('मुझे इस प्रोजेक्ट के बारे में बात करनी है', 'मुझे इस प्रोजेक्ट के बारे में बात करनी है।'),
+    ('मुझे उम इस इस प्रोजेक्ट के बारे में बात करनी है', 'मुझे इस प्रोजेक्ट के बारे में बात करनी है।'),
+    ('यह model अच्छा है लेकिन response slow है', 'यह model अच्छा है, लेकिन response slow है।'),
+    ('क़ीमत सही है', 'क़ीमत सही है।'),
+])
+def test_hindi_marks_punctuation_and_mixed_language(raw, cleaned):
+    validate_cleanup(raw, cleaned)
+
+
+def test_hindi_words_keep_vowel_marks_and_reject_changed_meaning():
+    from backend.cleanup import _tokens
+    assert _tokens('मुझे हिंदी में बताओ') == {'मुझे': 1, 'हिंदी': 1, 'में': 1, 'बताओ': 1}
+    with pytest.raises(ValueError):
+        validate_cleanup('मुझे हिंदी में बताओ', 'मुझे गणित में बताओ।')
+
+
+def test_hindi_number_formatting_preserves_values():
+    validate_cleanup('मेरे पास दो किताबें हैं', 'मेरे पास २ किताबें हैं।')
+    with pytest.raises(ValueError):
+        validate_cleanup('मेरे पास दो किताबें हैं', 'मेरे पास ३ किताबें हैं।')

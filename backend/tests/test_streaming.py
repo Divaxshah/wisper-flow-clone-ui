@@ -281,3 +281,25 @@ def test_warmup_exercises_disposable_sessions_for_every_profile(monkeypatch):
     assert [s.profile for s in sessions] == list(asr.NEMOTRON_CHUNK_PROFILES)
     assert all(s.flushed and s.audio == bytes(20) for s in sessions)
     assert restored == [('auto', asr.NEMOTRON_DEFAULT_CHUNK)]
+
+
+def test_timing_logs_and_cleanup_rejection_reason(client, monkeypatch, caplog):
+    import logging
+    caplog.set_level(logging.INFO, logger='uvicorn.error')
+    def reject(raw):
+        raise server.CleanupValidationError('Cleanup introduced unsupported or repeated words.')
+    monkeypatch.setattr(server, 'cleanup_span', reject)
+    with client.websocket_connect('/ws/transcribe') as ws:
+        ws.receive_json()
+        start(ws, cleanup=True)
+        ws.send_bytes(b'\0\x40')
+        ws.send_json({'type': 'end'})
+        events = until(ws, 'ended')
+        warning = next(e for e in events if e['type'] == 'warning')
+        assert 'unsupported or repeated words' in warning['message']
+    assert 'stage=first_audio' in caplog.text
+    assert 'stage=first_signal' in caplog.text
+    assert 'stage=first_text' in caplog.text
+    assert 'step_ms=' in caplog.text
+    assert 'cleanup_failed' in caplog.text
+    assert 'revision=1' in caplog.text
