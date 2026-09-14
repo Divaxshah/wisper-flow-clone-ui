@@ -483,6 +483,7 @@ async function startListening() {
   setPhase("starting");
   stopRequested = false;
   sessionNumber += 1;
+  const recording = sessionNumber;
   cleanupRequested = cleanupEl.checked;
   followLive = true;
   followTranscript();
@@ -547,9 +548,24 @@ async function startListening() {
       return;
     }
     capture = handle;
+    // A connected audio graph can still be waiting for its first microphone
+    // samples. Do not invite speech until a PCM frame has actually been sent.
+    let micTimer = 0;
+    try {
+      await Promise.race([
+        handle.ready,
+        new Promise<never>((_, reject) => {
+          micTimer = window.setTimeout(() => reject(new Error("The microphone is not delivering audio. Check your input device and retry.")), 8000);
+        }),
+      ]);
+    } finally {
+      window.clearTimeout(micTimer);
+    }
+    if (socket !== ws) return;
     setPhase("listening");
     if (stopRequested) await stopListening();
   } catch (err) {
+    if (sessionNumber !== recording) return;
     await resetSession(
       err instanceof Error ? err.message : "Microphone could not start.",
     );

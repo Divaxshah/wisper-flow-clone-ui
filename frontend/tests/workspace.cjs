@@ -79,6 +79,7 @@ const assert = require("node:assert/strict");
     await page.waitForFunction(
       () => document.body.dataset.phase === "listening",
     );
+    assert.ok(chunks > 0, "Listening indicator appeared before microphone PCM arrived");
     assert.equal(await page.locator("#language-button").isDisabled(), true);
     await page.waitForTimeout(200);
     const before = await page.locator("#pedal").boundingBox();

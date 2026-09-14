@@ -38,7 +38,8 @@ Set `OPENROUTER_API_KEY` in a `.env` at this repository's root or in `backend/`.
 ## Streaming behavior
 
 - The browser sends mono, 16 kHz PCM16 frames during recording and flushes the worklet tail before sending `end`.
-- A session starts only after the server acknowledges it. Each session has fresh encoder and decoder caches.
+- The server warms up all supported streaming chunk shapes before reporting ready. Warm-up uses disposable sessions; each real session has fresh encoder and decoder caches.
+- The UI waits for the server acknowledgement and the first delivered microphone PCM frame before showing Listening. Microphone startup without audio times out with a retryable error. The first recognized word still needs enough speech and model lookahead; it is not instantaneous.
 - **Balanced** uses 320 ms model chunks. The other profiles use 80, 560, or 1120 ms. Actual response time also depends on hardware and backlog.
 - Feature extraction preserves waveform context across boundaries, uses 20 ms of future audio for the centered STFT, and passes exactly the new feature frames into the model cache.
 - The server publishes a partial after each model step. Pause commits and final flush wait for queued inference, so they cannot mutate caches concurrently.

@@ -71,6 +71,7 @@ function rms(input: Float32Array): number {
 }
 
 export type CaptureHandle = {
+  ready: Promise<void>;
   stop: () => Promise<void>;
 };
 
@@ -132,6 +133,8 @@ export async function startCapture(options: {
   node.connect(mute);
   mute.connect(context.destination);
 
+  let firstAudio: (() => void) | null = null;
+  const ready = new Promise<void>(resolve => { firstAudio = resolve; });
   let spoken = false;
   let silentSince: number | null = null;
   let paused = false;
@@ -158,6 +161,8 @@ export async function startCapture(options: {
     if (typeof event.data === "string") { stopAck?.(); return; }
     const resampled = resampleTo16k(event.data, context.sampleRate);
     options.onPcm(floatToPcm16(resampled));
+    firstAudio?.();
+    firstAudio = null;
 
     const level = rms(resampled);
     const now = performance.now();
@@ -176,6 +181,7 @@ export async function startCapture(options: {
   };
 
   return {
+    ready,
     stop: () => stopping ??= (async () => {
       cancelAnimationFrame(raf);
       try {

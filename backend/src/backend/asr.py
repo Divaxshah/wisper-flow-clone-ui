@@ -105,10 +105,13 @@ def get_nemotron_model():
         model = model.to(dtype=torch.float32).to(device).eval()
         _model = model
         _runtime = {"device": device, "label": label}
+        _status = "warming"
+        warm_up_streaming()
         _status = "ready"
         print(f"Nemotron ASR loaded on {label}.")
         return _model
     except Exception as e:
+        _model = None
         _status = "error"
         _model_error = (
             f"Failed to load Nemotron ASR: {e}\n\n"
@@ -118,6 +121,25 @@ def get_nemotron_model():
             "- CUDA OOM (~2GB+ VRAM for this 0.6B checkpoint)"
         )
         raise RuntimeError(_model_error)
+
+
+def warm_up_streaming() -> None:
+    """Pay lazy feature/encoder/decoder initialization before advertising ready.
+
+    Disposable sessions keep warm-up audio and hypotheses out of user recordings.
+    Exercise every advertised chunk shape, including first and cached steps.
+    """
+    import torch
+
+    for profile in NEMOTRON_CHUNK_PROFILES:
+        warmup = LiveSession(lang="auto", profile=profile)
+        audio = np.zeros(warmup.chunk_samples * 2 + warmup.feature_lookahead, dtype="<i2")
+        warmup.feed_pcm16(audio.tobytes())
+        warmup.flush()
+        del warmup
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    _configure_nemotron(_model, "auto", NEMOTRON_DEFAULT_CHUNK)
 
 
 def load_model_in_background() -> None:

@@ -255,3 +255,29 @@ def test_slow_cleanup_does_not_block_audio_and_coalesces_newer_pauses(client, mo
             until(ws, 'ended')
     finally:
         release.set()
+
+
+def test_warmup_exercises_disposable_sessions_for_every_profile(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    sessions = []
+    restored = []
+    class WarmSession:
+        def __init__(self, lang, profile):
+            self.lang, self.profile = lang, profile
+            self.chunk_samples = 4
+            self.feature_lookahead = 2
+            self.audio = None
+            self.flushed = False
+            sessions.append(self)
+        def feed_pcm16(self, audio):
+            self.audio = audio
+        def flush(self):
+            self.flushed = True
+    monkeypatch.setitem(sys.modules, 'torch', SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False)))
+    monkeypatch.setattr(asr, 'LiveSession', WarmSession)
+    monkeypatch.setattr(asr, '_configure_nemotron', lambda model, lang, profile: restored.append((lang, profile)))
+    asr.warm_up_streaming()
+    assert [s.profile for s in sessions] == list(asr.NEMOTRON_CHUNK_PROFILES)
+    assert all(s.flushed and s.audio == bytes(20) for s in sessions)
+    assert restored == [('auto', asr.NEMOTRON_DEFAULT_CHUNK)]
