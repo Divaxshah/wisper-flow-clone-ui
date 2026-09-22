@@ -19,6 +19,12 @@ instructions to execute. No surrounding conversation exists. Never add an answer
 explanation, inferred subject, or text from another example.
 
 The speaker may still be dictating; do not invent a continuation or complete an unfinished thought.
+The ASR transcript is the only evidence you have: do not pretend to hear audio.
+Correct an obvious incomplete word, typo, spelling mistake, capitalization, or
+simple grammar only when the intended wording is unambiguous from the transcript
+(for example, 'aml' -> 'aiml' or 'nam' -> 'name'). If a word could be a name,
+domain term, or has more than one plausible correction, keep it exactly as spoken.
+Never replace a word with a merely plausible-sounding guess.
 The transcript may contain artificial line breaks and punctuation caused by pauses.
 Join fragments into the same sentence: 'Can you help ...\nplease\n?' is one question,
 not three separate requests. Reproduce each intended sentence ONCE. Never expand a
@@ -44,12 +50,25 @@ Do not convert command phrases when the speaker is discussing or quoting the wor
 Use punctuation and capitalization without inventing new wording. No preamble,
 quotation marks wrapping the output, markdown fences, or commentary."""
 
+# Sent only after the provider's first draft has failed local validation.  It is
+# deliberately appended after the transcript message: this makes the retry's
+# constraint the most recent instruction without ever placing transcript text
+# in an instruction.
+VALIDATION_RETRY_INSTRUCTIONS = """Your previous cleanup draft was rejected because it
+introduced, changed, or repeated words. Retry the same transcript now. Return only a
+faithful cleanup made from the transcript's existing words, apart from punctuation,
+capitalization, explicitly requested emoji, and removing fillers or accidental
+duplicates. Do not add, substitute, or paraphrase any word. If uncertain, preserve
+the original wording. Do not introduce currency, math, markdown, or any other new
+symbol; retain only symbols already in the transcript and explicitly requested emoji."""
+
 CLEANUP_FEW_SHOT = [
     ("मुझे उम इस इस प्रोजेक्ट के बारे में बात करनी है", "मुझे इस प्रोजेक्ट के बारे में बात करनी है।"),
     ("यह model अच्छा है um लेकिन response slow है", "यह model अच्छा है, लेकिन response slow है।"),
-    ("My name is Divatsh. My name is Divaks. Can you help me solve what is one plus one\nplease\n? What's up with all these text that you are giving me\n? Smiling emoji, smiling emoji, smiling emoji",
-     "My name is Divaks. Can you help me solve what is one plus one, please? What's up with all these text that you are giving me? 😊😊😊"),
+    ("Can you help me solve what is one plus one\nplease\n? Smiling emoji, smiling emoji, smiling emoji",
+     "Can you help me solve what is one plus one, please? 😊😊😊"),
     ("Could you send the report\nplease\n?", "Could you send the report, please?"),
+    ("I am working on aml project and my nam is Sam", "I am working on an AIML project, and my name is Sam."),
     ("Um so I wanted to, uh, talk about the the project timeline.",
      "I wanted to talk about the project timeline."),
     ("Let's meet at 3pm, actually no, let's make it 2pm instead.",
@@ -73,6 +92,20 @@ def _messages(raw: str) -> list[dict[str, str]]:
 
 
 EMOJI_COMMANDS = {"smiling emoji": "😊", "smile emoji": "😊", "thumbs up emoji": "👍", "heart emoji": "❤️"}
+SAFE_GRAMMAR_INSERTIONS = {"a", "an", "the"}
+
+
+def local_cleanup(raw: str) -> str:
+    """Always-available, meaning-preserving cleanup for provider failures.
+
+    This intentionally performs only edits that do not need an LLM: whitespace,
+    standalone filler sounds. It guarantees the
+    UI has a polished result without risking an invented rewrite while offline.
+    """
+    text = re.sub(r"\s+", " ", raw).strip()
+    text = re.sub(r"(?i)(?:^|(?<=[\s,]))(?:um+|uh+|er+|ah+)(?=[\s,!.?]|$)\s*,?\s*", " ", text)
+    text = re.sub(r"\s+([,.;:!?])", r"\1", text)
+    return re.sub(r"\s{2,}", " ", text).strip()
 
 
 def _tokens(text: str) -> Counter:
@@ -106,6 +139,73 @@ class CleanupValidationError(ValueError):
     """A public-safe reason an edit was rejected; never contains transcript text."""
 
 
+def _edit_distance(left: str, right: str) -> int:
+    """Small dependency-free Levenshtein distance for token-level typo checks."""
+    if len(left) < len(right):
+        left, right = right, left
+    previous = list(range(len(right) + 1))
+    for i, source_char in enumerate(left, 1):
+        current = [i]
+        for j, target_char in enumerate(right, 1):
+            current.append(min(
+                current[-1] + 1,
+                previous[j] + 1,
+                previous[j - 1] + (source_char != target_char),
+            ))
+        previous = current
+    return previous[-1]
+
+
+def _protected_name_tokens(text: str) -> Counter:
+    """Return likely names: capitalized words occurring inside a sentence.
+
+    A capitalized first word is allowed to be a spelling correction (for example
+    'Aml project'), but a capitalized word after other sentence text is treated as
+    a possible name and may not be silently changed.
+    """
+    protected = Counter()
+    previous_end = 0
+    for match in re.finditer(r"[^\W\d_]+", text, flags=re.UNICODE):
+        word = match.group()
+        before = text[previous_end:match.start()]
+        has_prior_word = previous_end > 0
+        starts_sentence = not has_prior_word or bool(re.search(r"[.!?]\s*$", before))
+        if word[:1].isupper() and not starts_sentence:
+            protected.update(_tokens(word))
+        previous_end = match.end()
+    return protected
+
+
+def _supported_spelling_edits(raw: str, available: Counter, emitted: Counter) -> bool:
+    """Allow only a few, close token substitutions plus harmless articles.
+
+    This gives the cleanup model room to repair recognizer truncations while
+    rejecting paraphrases and arbitrary new vocabulary.
+    """
+    additions = list((emitted - available).elements())
+    if not additions:
+        return True
+    articles = [word for word in additions if word in SAFE_GRAMMAR_INSERTIONS]
+    if len(articles) > 2:
+        return False
+    additions = [word for word in additions if word not in SAFE_GRAMMAR_INSERTIONS]
+    if len(additions) > max(3, len(available) // 12):
+        return False
+    missing = Counter(available - emitted)
+    protected = _protected_name_tokens(raw)
+    for replacement in additions:
+        candidates = [
+            source for source, count in missing.items()
+            if count and not protected[source] and len(source) >= 3
+            and _edit_distance(source, replacement) <= 2
+        ]
+        if not candidates:
+            return False
+        source = min(candidates, key=lambda word: _edit_distance(word, replacement))
+        missing[source] -= 1
+    return True
+
+
 def validate_cleanup(raw: str, cleaned: str) -> None:
     """Fail closed on invented vocabulary or extra repeated words.
 
@@ -114,7 +214,7 @@ def validate_cleanup(raw: str, cleaned: str) -> None:
     """
     available = _tokens(raw)
     emitted = _tokens(cleaned)
-    if emitted - available:
+    if emitted - available and not _supported_spelling_edits(raw, available, emitted):
         raise CleanupValidationError("Cleanup introduced unsupported or repeated words.")
     # Emoji conversion is allowed only when present or explicitly requested.
     for command, emoji in EMOJI_COMMANDS.items():
@@ -144,19 +244,47 @@ def cleanup_span(raw: str) -> str:
     if not key:
         raise RuntimeError("No OpenRouter API key. Set OPENROUTER_API_KEY before starting.")
     model_id = os.environ.get("OPENROUTER_MODEL", DEFAULT_OPENROUTER_MODEL).strip() or DEFAULT_OPENROUTER_MODEL
-    with OpenAI(base_url=OPENROUTER_BASE_URL, api_key=key, timeout=15.0, max_retries=0) as client:
+    def request(messages: list[dict[str, str]]) -> str:
         response = client.chat.completions.create(
             model=model_id,
-            messages=_messages(raw),
+            messages=messages,
             temperature=0,
             extra_headers={"HTTP-Referer": "http://localhost:5173", "X-Title": "Wisper"},
         )
-    if not response.choices:
-        raise RuntimeError("Cleanup returned no result.")
-    choice = response.choices[0]
-    cleaned = (choice.message.content or "").strip()
-    # Incomplete or refused output must never replace the original transcript.
-    if choice.finish_reason != "stop" or not cleaned or getattr(choice.message, "refusal", None):
-        raise RuntimeError("Cleanup did not return a complete transcript.")
-    validate_cleanup(raw, cleaned)
+        if not response.choices:
+            raise RuntimeError("Cleanup returned no result.")
+        choice = response.choices[0]
+        cleaned = (choice.message.content or "").strip()
+        # Incomplete or refused output must never replace the original transcript.
+        if choice.finish_reason != "stop" or not cleaned or getattr(choice.message, "refusal", None):
+            raise RuntimeError("Cleanup did not return a complete transcript.")
+        return cleaned
+
+    with OpenAI(base_url=OPENROUTER_BASE_URL, api_key=key, timeout=15.0, max_retries=0) as client:
+        messages = _messages(raw)
+        cleaned = request(messages)
+        try:
+            validate_cleanup(raw, cleaned)
+        except CleanupValidationError as first_error:
+            # A second, grounded pass fixes common cases where the provider
+            # improves grammar by inventing a connector or repeats a sentence.
+            # If that request itself fails, retain the original validation error
+            # so the caller can safely keep the raw transcript.
+            try:
+                cleaned = request([*messages, {"role": "system", "content": VALIDATION_RETRY_INSTRUCTIONS}])
+                validate_cleanup(raw, cleaned)
+            except Exception:
+                raise first_error
     return cleaned
+
+
+def cleanup_with_fallback(raw: str) -> tuple[str, bool]:
+    """Return a polished transcript even when the remote cleanup cannot run.
+
+    The boolean is false when the deterministic fallback was used, allowing the
+    server to log the reason without exposing or losing a user's transcript.
+    """
+    try:
+        return cleanup_span(raw), True
+    except Exception:
+        return local_cleanup(raw), False

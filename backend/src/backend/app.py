@@ -19,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from backend.asr import load_dotenv_files, load_model_in_background, runtime_status
-from backend.cleanup import cleanup_span, CleanupValidationError
+from backend.cleanup import CleanupValidationError, cleanup_span, local_cleanup
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -101,24 +101,28 @@ async def transcribe_socket(ws: WebSocket) -> None:
                 cleaned = await asyncio.to_thread(cleanup_span, raw)
                 result = "applied"
             except Exception as exc:
-                cleaned = raw
-                result = "failed"
+                # The provider has already retried a validation failure.  A
+                # local, deterministic pass means the transcript is still
+                # cleaned rather than left in a failed raw-only state.
+                cleaned = await asyncio.to_thread(local_cleanup, raw)
+                result = "applied"
                 if isinstance(exc, CleanupValidationError):
-                    failure_reason = str(exc)  # Our validator messages contain no transcript.
+                    failure_reason = str(exc)
                 elif getattr(exc, "status_code", None):
                     failure_reason = f"Provider HTTP {exc.status_code}"
                 else:
                     failure_reason = type(exc).__name__
-                logger.warning("cleanup_failed session=%s revision=%s reason=%s elapsed_ms=%.0f input_chars=%s",
-                               trace_id, revision, failure_reason, (time.monotonic()-cleanup_started)*1000, len(raw))
+                # This is a successful user-facing outcome: deterministic
+                # cleanup has been applied. Keep diagnostics in the server log
+                # without surfacing a misleading failure in the editor.
+                logger.info("cleanup_fallback session=%s revision=%s reason=%s elapsed_ms=%.0f input_chars=%s",
+                            trace_id, revision, failure_reason, (time.monotonic()-cleanup_started)*1000, len(raw))
             # Newer pause snapshots supersede unfinished edits. Never append or
             # show an old response after a newer correction has been requested.
             if revision != polish_revision:
                 continue
             await send({"type": "polished", "ids": ids, "raw": raw,
                         "cleaned": cleaned, "cleanup_status": result, "revision": revision})
-            if result == "failed":
-                await send({"type": "warning", "message": f"Polishing failed ({failure_reason}). Your original words have been kept."})
 
     def request_polish(raw: str):
         nonlocal cleanup_task, pending_polish, polish_revision, last_requested_raw

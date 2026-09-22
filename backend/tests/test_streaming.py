@@ -112,7 +112,6 @@ def test_cleanup_failure_preserves_raw_and_allows_restart(client, monkeypatch):
         ws.send_bytes(b'\x00\x01')
         ws.send_json({'type': 'end'})
         events = until(ws, 'ended')
-        assert any(e['type'] == 'warning' for e in events)
         assert next(e for e in events if e['type'] == 'polished')['cleaned'] == 'word'
         start(ws)
         ws.send_json({'type': 'end'})
@@ -295,11 +294,9 @@ def test_timing_logs_and_cleanup_rejection_reason(client, monkeypatch, caplog):
         ws.send_bytes(b'\0\x40')
         ws.send_json({'type': 'end'})
         events = until(ws, 'ended')
-        warning = next(e for e in events if e['type'] == 'warning')
-        assert 'unsupported or repeated words' in warning['message']
     assert 'stage=first_audio' in caplog.text
     assert 'stage=first_signal' in caplog.text
     assert 'stage=first_text' in caplog.text
     assert 'step_ms=' in caplog.text
-    assert 'cleanup_failed' in caplog.text
+    assert 'cleanup_fallback' in caplog.text
     assert 'revision=1' in caplog.text

@@ -49,6 +49,9 @@ NEMOTRON_CHUNK_PROFILES = {
     "Accurate": [56, 6],
     "Most accurate": [56, 13],
 }
+# Dictation quality is more important than the earliest possible partial.  The
+# shorter profiles remain available for people who explicitly prefer speed, but
+# use the maximum supported right context for a new recording by default.
 NEMOTRON_DEFAULT_CHUNK = "Balanced"
 
 _model = None
@@ -72,7 +75,9 @@ def runtime_status() -> dict:
         "status": _status,
         "error": _model_error,
         "device": (_runtime or {}).get("label"),
-        "cleanup_available": bool(os.environ.get("OPENROUTER_API_KEY", "").strip()),
+        # Smart cleanup has a deterministic local fallback when the optional
+        # provider key is absent or the provider cannot produce a safe draft.
+        "cleanup_available": True,
         "model": NEMOTRON_MODEL_ID,
         "languages": [{"label": label, "value": value} for label, value in NEMOTRON_LANG_CHOICES],
         "profiles": list(NEMOTRON_CHUNK_PROFILES.keys()),

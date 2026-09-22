@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 import openai
-from backend.cleanup import cleanup_span, _messages, validate_cleanup
+from backend.cleanup import cleanup_span, cleanup_with_fallback, _messages, validate_cleanup
 
 
 def provider(monkeypatch, content, finish='stop', refusal=None):
@@ -51,6 +51,13 @@ def test_empty_input_does_not_need_provider(monkeypatch):
     assert cleanup_span('  ') == ''
 
 
+def test_provider_failure_uses_safe_local_cleanup(monkeypatch):
+    monkeypatch.delenv('OPENROUTER_API_KEY', raising=False)
+    cleaned, used_provider = cleanup_with_fallback(' Um,  this is   my note. ')
+    assert cleaned == 'this is my note.'
+    assert not used_provider
+
+
 USER_RAW = """Ai, my name is Divatsh
 á. My name is Divaks
 . Can you help me solve what is one plus one
@@ -77,6 +84,18 @@ def test_user_reported_duplication_and_paraphrase_is_rejected():
 
 def test_complete_recording_and_requested_emoji_pass_validation():
     validate_cleanup(USER_RAW, USER_GOOD)
+
+
+def test_unambiguous_spelling_completion_and_simple_article_pass_validation():
+    validate_cleanup('I am working on aml project and my nam is Sam.',
+                     'I am working on an AIML project, and my name is Sam.')
+
+
+def test_possible_name_and_semantic_word_changes_remain_rejected():
+    with pytest.raises(ValueError):
+        validate_cleanup('My name is Divaks.', 'My name is Divaksh.')
+    with pytest.raises(ValueError):
+        validate_cleanup('Please send the file.', 'Please send the mail.')
 
 
 @pytest.mark.parametrize('raw,cleaned', [
@@ -107,6 +126,30 @@ def test_provider_hallucination_is_not_returned(monkeypatch):
     provider(monkeypatch, USER_BAD)
     with pytest.raises(ValueError):
         cleanup_span(USER_RAW)
+
+
+def test_validation_failure_retries_with_grounded_instruction(monkeypatch):
+    responses = iter(["Please send the report tomorrow.", "Please send the report."])
+    calls = provider(monkeypatch, None)
+    # The generic provider helper returns the same content, so provide a small
+    # response sequence for the retry behavior itself.
+    import openai
+    class Client:
+        def __init__(self, **kwargs):
+            self.chat = SimpleNamespace(completions=self)
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(choices=[SimpleNamespace(
+                finish_reason="stop", message=SimpleNamespace(content=next(responses), refusal=None)
+            )])
+    monkeypatch.setattr(openai, "OpenAI", Client)
+    assert cleanup_span("Please send the report.") == "Please send the report."
+    assert len(calls) == 2
+    assert calls[-1]["messages"][-1]["role"] == "system"
 
 
 @pytest.mark.parametrize('raw,cleaned', [

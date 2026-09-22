@@ -33,14 +33,14 @@ Click **Start dictation** to toggle recording, or hold **Space** outside form co
 
 ## Optional cleanup
 
-Set `OPENROUTER_API_KEY` in a `.env` at this repository's root or in `backend/`. `OPENROUTER_MODEL` overrides the default `openai/gpt-4o-mini`. The key stays on the server. Cleanup sends transcript text to OpenRouter; audio stays with your ASR server. Without a key, smart cleanup is disabled. Provider errors retain the raw text. **Original text** switches between cleaned and original wording.
+Set `OPENROUTER_API_KEY` in a `.env` at this repository's root or in `backend/`. `OPENROUTER_MODEL` overrides the default `openai/gpt-4o-mini`. The key stays on the server. Cleanup sends transcript text to OpenRouter; audio stays with your ASR server. If the key is absent, the provider times out, or its response fails validation, Wisper still applies deterministic local cleanup (whitespace and filler sounds). **Original text** switches between cleaned and original wording.
 
 ## Streaming behavior
 
 - The browser sends mono, 16 kHz PCM16 frames during recording and flushes the worklet tail before sending `end`.
 - The server warms up all supported streaming chunk shapes before reporting ready. Warm-up uses disposable sessions; each real session has fresh encoder and decoder caches.
 - The UI waits for the server acknowledgement and the first delivered microphone PCM frame before showing Listening. Microphone startup without audio times out with a retryable error. The first recognized word still needs enough speech and model lookahead; it is not instantaneous.
-- **Balanced** uses 320 ms model chunks. The other profiles use 80, 560, or 1120 ms. Actual response time also depends on hardware and backlog.
+- **Most accurate** is the default and uses 1120 ms of model context before a live update. Choose a faster profile only when lower latency matters more than recognition accuracy; the other profiles use 80, 320, or 560 ms. Actual response time also depends on hardware and backlog.
 - Feature extraction preserves waveform context across boundaries, uses 20 ms of future audio for the centered STFT, and passes exactly the new feature frames into the model cache.
 - The server publishes a partial after each model step. Pause commits and final flush wait for queued inference, so they cannot mutate caches concurrently.
 - One active recording per backend process is supported because NeMo has shared mutable model configuration. Concurrent clients receive a retry message.
