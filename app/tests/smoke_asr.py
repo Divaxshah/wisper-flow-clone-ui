@@ -1,13 +1,13 @@
 """Run manually with a 16 kHz mono PCM16 speech WAV and installed NeMo.
 
-PYTHONPATH=backend/src python backend/tests/smoke_asr.py /path/to/speech.wav
+PYTHONPATH=app/src python app/tests/smoke_asr.py /path/to/speech.wav
 """
 import argparse
 import time
 import wave
 
 import torch
-from backend.asr import LiveSession
+from app.asr import LiveSession
 
 parser = argparse.ArgumentParser()
 parser.add_argument('wav')

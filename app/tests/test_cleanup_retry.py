@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import openai
 
-from backend.cleanup import cleanup_span
+from app.cleanup import cleanup_span
 
 
 def test_validation_failure_gets_one_grounded_retry(monkeypatch):

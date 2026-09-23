@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 import openai
-from backend.cleanup import cleanup_span, cleanup_with_fallback, _messages, validate_cleanup
+from app.cleanup import cleanup_span, cleanup_with_fallback, _messages, validate_cleanup
 
 
 def provider(monkeypatch, content, finish='stop', refusal=None):
@@ -163,7 +163,7 @@ def test_hindi_marks_punctuation_and_mixed_language(raw, cleaned):
 
 
 def test_hindi_words_keep_vowel_marks_and_reject_changed_meaning():
-    from backend.cleanup import _tokens
+    from app.cleanup import _tokens
     assert _tokens('मुझे हिंदी में बताओ') == {'मुझे': 1, 'हिंदी': 1, 'में': 1, 'बताओ': 1}
     with pytest.raises(ValueError):
         validate_cleanup('मुझे हिंदी में बताओ', 'मुझे गणित में बताओ।')

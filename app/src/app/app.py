@@ -12,14 +12,12 @@ import traceback
 import anyio
 from functools import partial
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 
-from backend.asr import load_dotenv_files, load_model_in_background, runtime_status
-from backend.cleanup import CleanupValidationError, cleanup_span, local_cleanup
+from app.asr import load_dotenv_files, load_model_in_background, runtime_status
+from app.cleanup import CleanupValidationError, cleanup_span, local_cleanup
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -185,7 +183,7 @@ async def transcribe_socket(ws: WebSocket) -> None:
                         continue
                     await model_slot.acquire()
                     owns_slot = True
-                    from backend.asr import LiveSession, NEMOTRON_DEFAULT_CHUNK
+                    from app.asr import LiveSession, NEMOTRON_DEFAULT_CHUNK
                     try:
                         session = await anyio.to_thread.run_sync(partial(
                             LiveSession, lang=payload.get("language") or "auto",
@@ -275,12 +273,7 @@ async def transcribe_socket(ws: WebSocket) -> None:
                     model_slot.release()
 
 
-frontend_dist = Path(__file__).resolve().parents[3] / "frontend" / "dist"
-if frontend_dist.is_dir():
-    app.mount("/", StaticFiles(directory=frontend_dist, html=True), name="ui")
-
-
 def main() -> None:
     import uvicorn
 
-    uvicorn.run("backend.app:app", host="0.0.0.0", port=8000, reload=False)
+    uvicorn.run("app.app:app", host="0.0.0.0", port=8000, reload=False)

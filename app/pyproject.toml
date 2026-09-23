@@ -1,5 +1,5 @@
 [project]
-name = "backend"
+name = "app"
 version = "0.1.0"
 description = "Realtime Nemotron ASR with pause-delimited sentence cleanup"
 readme = "README.md"
@@ -17,7 +17,7 @@ dependencies = [
 ]
 
 [project.scripts]
-backend = "backend:main"
+app = "app:main"
 
 [build-system]
 requires = ["uv_build>=0.12.9,<0.13.0"]

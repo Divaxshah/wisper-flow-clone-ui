@@ -1,108 +1,94 @@
-# Wisper live dictation
+# Wisper app
 
-Cache-aware Nemotron ASR streams text while you speak. Optional smart cleanup removes fillers and clear self-corrections while you record, after approximately 1.6 seconds of silence. Original text is always available in the transcript view.
+FastAPI app for real-time speech-to-text using NVIDIA Nemotron ASR. It accepts streamed PCM audio over WebSocket and can optionally clean transcripts with OpenRouter.
 
-## Run locally
+## Requirements
 
-From this repository, use two terminals:
+- Python 3.10+
+- [`uv`](https://docs.astral.sh/uv/)
+- A PyTorch/NeMo-compatible environment
+
+## Setup
 
 ```bash
-# Backend (Python 3.10+, with a compatible PyTorch/NeMo environment)
-cd backend
 uv sync
 uv pip install 'nemo_toolkit[asr] @ git+https://github.com/NVIDIA/NeMo.git'
-uv run backend
 ```
+
+## Run
 
 ```bash
-# Frontend, from this repository
-cd frontend
-npm ci
-npm run dev
+uv run app
 ```
 
-If you already have an environment with NeMo installed, run the backend from this repository with:
+The server starts at `http://127.0.0.1:8000`.
+
+Check model readiness with curl:
 
 ```bash
-PYTHONPATH=backend/src /path/to/environment/bin/python -m uvicorn backend.app:app --host 127.0.0.1 --port 8000
+curl --fail --silent --show-error http://127.0.0.1:8000/api/status
 ```
 
-Open the URL printed by Vite (normally http://127.0.0.1:5173). Vite proxies `/api` and `/ws` to port 8000; set `VITE_API_TARGET` to override it. A microphone requires localhost or HTTPS. For a remote browser, use an HTTPS tunnel to Vite.
+The response reports whether the speech model is loading, ready, or unavailable.
 
-Click **Start dictation** to toggle recording, or hold **Space** outside form controls and release to stop. You can also hold the recording button. Wait for **Finishing…** to complete before starting again. Subsequent recordings append to the same page. Text stays in memory until the page is closed or refreshed; copy anything you want to keep.
+## API
 
-## Optional cleanup
+### `GET /api/status`
 
-Set `OPENROUTER_API_KEY` in a `.env` at this repository's root or in `backend/`. `OPENROUTER_MODEL` overrides the default `openai/gpt-4o-mini`. The key stays on the server. Cleanup sends transcript text to OpenRouter; audio stays with your ASR server. If the key is absent, the provider times out, or its response fails validation, Wisper still applies deterministic local cleanup (whitespace and filler sounds). **Original text** switches between cleaned and original wording.
+Returns the current model/runtime status.
 
-## Streaming behavior
+### `WS /ws/transcribe`
 
-- The browser sends mono, 16 kHz PCM16 frames during recording and flushes the worklet tail before sending `end`.
-- The server warms up all supported streaming chunk shapes before reporting ready. Warm-up uses disposable sessions; each real session has fresh encoder and decoder caches.
-- The UI waits for the server acknowledgement and the first delivered microphone PCM frame before showing Listening. Microphone startup without audio times out with a retryable error. The first recognized word still needs enough speech and model lookahead; it is not instantaneous.
-- **Most accurate** is the default and uses 1120 ms of model context before a live update. Choose a faster profile only when lower latency matters more than recognition accuracy; the other profiles use 80, 320, or 560 ms. Actual response time also depends on hardware and backlog.
-- Feature extraction preserves waveform context across boundaries, uses 20 ms of future audio for the centered STFT, and passes exactly the new feature frames into the model cache.
-- The server publishes a partial after each model step. Pause commits and final flush wait for queued inference, so they cannot mutate caches concurrently.
-- One active recording per backend process is supported because NeMo has shared mutable model configuration. Concurrent clients receive a retry message.
-- Audio backlog is bounded. A slow or interrupted connection reports an error and preserves text already received, but does not replay lost audio.
-- Pause detection currently uses an energy threshold, not a trained voice activity model. After a 1.6-second pause, cleanup uses the canonical raw transcript of the recording so far, so corrections across pauses can be resolved. It runs in the background while audio and partial text continue streaming. Earlier recordings remain unchanged.
+Streams mono, 16 kHz PCM16 audio for transcription.
 
-## Checks
+1. Connect and wait for the `ready` message.
+2. Send a JSON `start` message.
+3. Send PCM16 audio as binary WebSocket frames.
+4. Send `commit` to commit a pause, or `end` to finish the recording.
+
+Example start message:
+
+```json
+{
+  "type": "start",
+  "language": "auto",
+  "profile": "Most accurate",
+  "cleanup": true
+}
+```
+
+The server emits messages such as `started`, `partial`, `commit`, `polishing`, `polished`, `ended`, `warning`, and `error`.
+
+Only one recording can use a backend process at a time because the NeMo model has shared mutable decoding state.
+
+## Transcript cleanup
+
+Add an OpenRouter key to `.env` in the repository root or `app/`:
+
+```dotenv
+OPENROUTER_API_KEY=your_key
+OPENROUTER_MODEL=openai/gpt-4o-mini
+```
+
+`OPENROUTER_MODEL` is optional. If remote cleanup is unavailable or its output fails validation, the backend applies conservative local cleanup instead. Audio is never sent to OpenRouter.
+
+## Tests
+
+From the repository root:
 
 ```bash
-cd frontend
-npm run build
-
-# From the repository root, in an environment with backend dependencies:
-python -m pip install pytest httpx
-PYTHONPATH=backend/src python -m pytest backend/tests -q
-
-# Real-model smoke test; requires NeMo and a 16 kHz mono PCM16 speech WAV:
-PYTHONPATH=backend/src python backend/tests/smoke_asr.py /path/to/speech.wav
+uv pip install --python .venv/bin/python pytest
+PYTHONPATH=app/src python -m pytest app/tests -q
 ```
 
-The regression suite checks partials before end, repeated recording, unique sentence IDs, stop/drain ordering, duplicate start, cleanup failure, disconnect recovery, and audio queue limits. The real-model check runs two independent recordings and requires nonempty partials before either ends.
-
-## Serve the built UI
+Real-model smoke test with a mono, 16 kHz PCM16 WAV file:
 
 ```bash
-cd frontend
-npm run build
+PYTHONPATH=app/src python app/tests/smoke_asr.py /path/to/speech.wav
 ```
 
-Restart the backend; it serves `frontend/dist` at http://127.0.0.1:8000. This is a local single-user tool, without authentication or production deployment hardening.
-
-## Reference guidance
-
-- [NVIDIA model and cache-aware streaming guidance](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b)
-- [Wispr Flow smart formatting and backtrack](https://docs.wisprflow.ai/articles/5373093536-how-do-i-use-smart-formatting-and-backtrack)
-- [Google Gboard Rambler](https://support.google.com/gboard/answer/17468539)
-
-## Workspace and cleanup checks
-
-The workspace now has an internally scrolling transcript and a persistent recording bar. It follows live text only while you are at the bottom; **Back to live text** resumes following after you scroll up. The **Original / Polished** control preserves both versions. A status below the document distinguishes pending cleanup, applied cleanup, and a fallback to original wording.
-
-Cleanup is instructed to retain complete sentences and speech intent rather than summarize text into topic labels. Empty, refused, and incomplete provider responses preserve the original text and report a failure. Cleanup runs after longer pauses using the recording so far, without any previous generated text. One request runs at a time, and only the newest waiting snapshot is kept. Superseded responses are discarded. Results replace only their committed prefix; newer live words stay visible. Stopping flushes remaining audio and waits for the latest required pass, without repeating unchanged work. A conservative output check rejects new vocabulary, unsupported symbols, and added word repetitions; rejected output leaves the full original recording visible. This is a guardrail, not a guarantee of semantic equivalence, and can reject otherwise reasonable paraphrases.
+Optional OpenRouter cleanup smoke test:
 
 ```bash
-# Run Vite in a separate terminal, then from frontend/:
-npx playwright install chromium
-npm run test:ui
-# Or use installed Chrome:
-CHROME_PATH=/usr/bin/google-chrome npm run test:ui
-
-# From the repository root, with a configured OpenRouter key:
-PYTHONPATH=backend/src python backend/tests/smoke_cleanup.py
+PYTHONPATH=app/src python app/tests/smoke_cleanup.py
 ```
-
-The browser suite mocks ASR and uses synthetic microphone audio to check layout stability with long transcripts, 320/390 px mobile layouts, language and recognition controls, cleanup status, original/polished switching, and recording restart. The optional cleanup smoke test sends public regression fixtures to the configured model and incurs API usage; read its outputs to assess meaning preservation.
-
-## Diagnosing latency and cleanup failures
-
-The backend logs `asr_started` and `asr_timing` with a short per-recording session ID. Times are measured from the server's `started` acknowledgement:
-
-- `first_audio`: first PCM packet received; a late arrival points to microphone startup or transport.
-- `first_signal`: first packet above the energy threshold (not a speech classifier). A late signal after early packets may mean initial silence or microphone behavior.
-- `first_inference` / `first_text`: first model step and first nonempty result. `step_ms`, `inference_ms`, `steps`, and `received_audio_ms` help distinguish compute cost from waiting for sufficient speech. These logs do not measure browser rendering latency.
-
-`cleanup_failed` includes a safe validation reason, provider HTTP status, or exception class, plus duration and input length. It does not log transcript contents or credentials. Hindi combining marks, danda punctuation, and canonically equivalent nukta forms are supported by the validator. The guard is still conservative; genuine rewording can be rejected, retaining original text.

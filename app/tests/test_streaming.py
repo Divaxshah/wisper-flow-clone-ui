@@ -5,8 +5,8 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
-from backend import app as server
-from backend import asr
+from app import app as server
+from app import asr
 
 
 class FakeSession:

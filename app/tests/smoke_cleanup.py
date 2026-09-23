@@ -1,11 +1,11 @@
 """Opt-in live cleanup check: requires OPENROUTER_API_KEY and sends public fixtures.
 
-PYTHONPATH=backend/src python backend/tests/smoke_cleanup.py
+PYTHONPATH=app/src python app/tests/smoke_cleanup.py
 This makes billable requests to the configured OpenRouter model.
 """
-from backend.asr import load_dotenv_files
+from app.asr import load_dotenv_files
 load_dotenv_files()
-from backend.cleanup import cleanup_span
+from app.cleanup import cleanup_span
 
 cases = [
     ('Fragmented question and repeated emoji', "My name is Divatsh. My name is Divaks. Can you help me solve what is one plus one\nplease\n? What's up with all these text that you are giving me\n? Smiling emoji, smiling emoji, smiling emoji", ['Divaks', 'please', 'giving me', '😊😊😊']),
