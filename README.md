@@ -59,6 +59,8 @@ Example start message:
 
 The server emits messages such as `started`, `partial`, `commit`, `polishing`, `polished`, `ended`, `warning`, and `error`.
 
+For a short client handoff, see [Developer integration guide](docs/INTEGRATION.md).
+
 Only one recording can use a backend process at a time because the NeMo model has shared mutable decoding state.
 
 ## Transcript cleanup
